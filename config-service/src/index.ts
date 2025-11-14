@@ -36,6 +36,27 @@ const pool = mysql.createPool({
 
 // (moved below after authMiddleware definition)
 
+// Ensure device_logs table exists
+async function ensureDeviceLogsTable() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS device_logs (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        device_id INT NOT NULL,
+        level VARCHAR(16) NOT NULL DEFAULT 'info',
+        message TEXT NOT NULL,
+        meta JSON NULL,
+        created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_device_logs_device (device_id),
+        INDEX idx_device_logs_created (created_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+  } catch (e) {
+    console.error('[LOGS] ensure table error:', e);
+  }
+}
+ensureDeviceLogsTable();
+
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
 // Auth middleware
@@ -509,6 +530,50 @@ app.put('/devices/:deviceId/active', authMiddleware, async (req: express.Request
     return res.json({ ok: true, active: !!val });
   } catch (err) {
     console.error('PUT /devices/:id/active error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Device logs endpoints
+app.post('/devices/:deviceId/logs', authMiddleware, async (req: express.Request, res: express.Response) => {
+  const userId = (req as any).user.userId;
+  const { deviceId } = req.params as any;
+  const { level = 'info', message = '', meta = null } = req.body || {};
+  if (!message || typeof message !== 'string') return res.status(400).json({ error: 'message required' });
+  try {
+    const [owns] = await pool.query<RowDataPacket[]>('SELECT id FROM devices WHERE id = ? AND user_id = ? LIMIT 1', [deviceId, userId]);
+    if ((owns as any[]).length === 0) return res.status(404).json({ error: 'Device not found' });
+    const metaStr = meta == null ? null : (typeof meta === 'string' ? meta : JSON.stringify(meta));
+    await pool.query('INSERT INTO device_logs (device_id, level, message, meta) VALUES (?, ?, ?, CAST(? AS JSON))', [deviceId, String(level).toLowerCase(), message, metaStr]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /devices/:deviceId/logs error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/devices/:deviceId/logs', authMiddleware, async (req: express.Request, res: express.Response) => {
+  const userId = (req as any).user.userId;
+  const { deviceId } = req.params as any;
+  const limit = Math.min(Math.max(parseInt(String(req.query.limit || '200'), 10) || 200, 1), 1000);
+  const level = (req.query.level as string) || '';
+  const q = (req.query.q as string) || '';
+  const sinceMinutes = Math.max(parseInt(String(req.query.sinceMinutes || '1440'), 10) || 1440, 1);
+  try {
+    const [owns] = await pool.query<RowDataPacket[]>('SELECT id FROM devices WHERE id = ? AND user_id = ? LIMIT 1', [deviceId, userId]);
+    if ((owns as any[]).length === 0) return res.status(404).json({ error: 'Device not found' });
+
+    const where: string[] = ['device_id = ?', 'created_at >= (NOW() - INTERVAL ? MINUTE)'];
+    const params: any[] = [deviceId, sinceMinutes];
+    if (level) { where.push('level = ?'); params.push(level.toLowerCase()); }
+    if (q) { where.push('message LIKE ?'); params.push(`%${q}%`); }
+
+    const sql = `SELECT id, level, message, meta, created_at FROM device_logs WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT ?`;
+    params.push(limit);
+    const [rows] = await pool.query<RowDataPacket[]>(sql, params);
+    return res.json(rows);
+  } catch (err) {
+    console.error('GET /devices/:deviceId/logs error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 });

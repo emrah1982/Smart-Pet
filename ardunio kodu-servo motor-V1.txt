@@ -1,0 +1,452 @@
+/*
+  Always-AP + Captive Portal + RSSI-sorted scan + STA connect (ESP8266/ESP32)
+  - Cihaz açılır açılmaz AP açar: SSID "D1R32-Provision", PASS "12345678"
+  - Aynı anda STA aktif: /scan ile çevredeki Wi-Fi'lar listelenir (RSSI'ye göre)
+  - Portal: http://192.168.4.1  → SSID seç + şifre gir → kaydet → bağlan
+  - Bağlandıktan sonra MAC ve MAC'ten türetilmiş seri no yazdırılır
+  - Güvenlik için bağlandıktan sonra AP kapatılır (istersen yorum satırını kaldırıp açık bırak)
+  - Serial Plotter çıktısı: "ServoAngle:90 RSSI:-62 InternetOK:1"
+*/
+
+#if defined(ESP8266)
+  #include <ESP8266WiFi.h>
+  #include <ESP8266HTTPClient.h>
+  #include <ESP8266WebServer.h>
+  #include <DNSServer.h>
+  #include <EEPROM.h>
+  #include <Servo.h>
+#elif defined(ESP32)
+  #include <WiFi.h>
+  #include <HTTPClient.h>
+  #include <WebServer.h>
+  #include <DNSServer.h>
+  #include <Preferences.h>
+  #include <ESP32Servo.h>
+#else
+  #error "Only ESP8266 or ESP32 is supported."
+#endif
+
+#include <WiFiClientSecure.h>
+
+// ---------- Sabitler ----------
+#define BAUDRATE               115200
+#define PLOT_INTERVAL_MS        500
+#define NET_CHECK_INTERVAL_MS  5000
+#define SERVO_STEP_INTERVAL_MS 1000
+#define SERVO_MIN_US             500
+#define SERVO_MAX_US            2400
+
+const char* AP_SSID = "Secgem-Smart-Pet-Freeder-Provision";
+const char* AP_PASS = "12345678";    // min 8 karakter
+IPAddress apIP(192,168,4,1);
+IPAddress netMsk(255,255,255,0);
+const byte DNS_PORT = 53;
+
+// >>> CAPTIVE hedef URL — kullanıcıya da bu yönerge verilecek
+const char* CAPTIVE_URL = "http://wifi/";  // istersen "http://192.168.4.1/" yapabilirsin
+
+#if defined(ESP8266)
+  ESP8266WebServer portalServer(80);
+  DNSServer dnsServer;
+  const int EEPROM_SIZE = 512;
+#else
+  WebServer portalServer(80);
+  DNSServer dnsServer;
+  Preferences prefs;
+#endif
+
+// ---------- Global ----------
+#if defined(ESP32)
+  const uint8_t SERVO_PIN = 18;   // 5/18/19/21/22/23
+#else
+  const uint8_t SERVO_PIN = D5;   // GPIO14
+#endif
+
+Servo servo;
+bool  servoReady   = false;
+int   g_servoAngle = 90;
+bool  g_netOK      = false;
+unsigned long t_lastPlot  = 0;
+unsigned long t_lastNet   = 0;
+unsigned long t_lastServo = 0;
+
+String savedSSID = "";
+String savedPASS = "";
+
+// ---------- Yardımcılar ----------
+static inline void plotLine(int servoAngle, int rssi, int internetOK) {
+  Serial.print("ServoAngle:"); Serial.print(servoAngle);
+  Serial.print(" RSSI:");      Serial.print(rssi);
+  Serial.print(" InternetOK:");Serial.println(internetOK);
+}
+static inline int clamp(int v, int lo, int hi){ return (v<lo)?lo:((v>hi)?hi:v); }
+
+// ---------- Storage ----------
+void saveCredentials(const String &ssid, const String &pass) {
+#if defined(ESP32)
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+  Serial.println("[STORAGE] Kaydedildi (ESP32).");
+#else
+  EEPROM.begin(EEPROM_SIZE);
+  int addr = 0;
+  byte sl = ssid.length(); if (sl > 100) sl = 100;
+  byte pl = pass.length(); if (pl > 100) pl = 100;
+  EEPROM.write(addr++, sl);
+  for (int i=0;i<sl;i++) EEPROM.write(addr++, ssid[i]);
+  EEPROM.write(addr++, pl);
+  for (int i=0;i<pl;i++) EEPROM.write(addr++, pass[i]);
+  for (; addr < EEPROM_SIZE; addr++) EEPROM.write(addr, 0);
+  EEPROM.commit();
+  Serial.println("[STORAGE] Kaydedildi (ESP8266).");
+#endif
+}
+bool loadCredentials() {
+#if defined(ESP32)
+  prefs.begin("wifi", true);
+  savedSSID = prefs.getString("ssid", "");
+  savedPASS = prefs.getString("pass", "");
+  prefs.end();
+  if (savedSSID.length()) { Serial.println("[STORAGE] Credentials yüklendi (ESP32)."); return true; }
+  return false;
+#else
+  EEPROM.begin(EEPROM_SIZE);
+  int addr = 0;
+  byte sl = EEPROM.read(addr++);
+  if (sl == 0 || sl > 100) return false;
+  char buf[128];
+  for (int i=0;i<sl;i++) buf[i] = (char)EEPROM.read(addr++);
+  buf[sl] = 0; savedSSID = String(buf);
+  byte pl = EEPROM.read(addr++);
+  if (pl > 100) return false;
+  for (int i=0;i<pl;i++) buf[i] = (char)EEPROM.read(addr++);
+  buf[pl] = 0; savedPASS = String(buf);
+  Serial.println("[STORAGE] Credentials yüklendi (ESP8266).");
+  return savedSSID.length();
+#endif
+}
+
+// ---------- Portal HTML ----------
+const char* portalPage = R"rawliteral(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>WiFi Provision</title>
+<style>
+body{font-family:Arial;padding:10px;background:#f7f7f7;}
+.card{background:#fff;padding:12px;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,0.15);}
+h2{margin:0 0 8px 0;}
+label{display:block;margin-top:8px;font-size:14px;}
+input[type=text], input[type=password], select{width:100%;padding:8px;margin-top:6px;border:1px solid #ddd;border-radius:4px;}
+button{margin-top:12px;padding:10px 14px;border:0;background:#2196F3;color:#fff;border-radius:6px;font-size:16px;}
+.small{font-size:12px;color:#666;margin-top:8px;}
+.loading{font-size:13px;color:#999;}
+</style>
+</head><body>
+<div class="card">
+  <h2>Wi-Fi Ayarları</h2>
+  <div class="small">Aşağıdan ağı seçin (sinyal gücüne göre sıralı) veya manuel yazın.</div>
+  <form action="/save" method="POST">
+    <label>Mevcut Ağlar</label>
+    <select id="ssidList" name="ssid"><option value="">-- SSID taranıyor --</option></select>
+    <label>Veya manuel SSID</label>
+    <input type="text" id="manual" name="manual" placeholder="Gizli ağ için SSID yaz (opsiyonel)">
+    <label>Şifre</label>
+    <input type="password" name="pass" placeholder="WiFi Parolası (boş bırakılabilir)">
+    <button type="submit">Kaydet ve Bağlan</button>
+  </form>
+  <div class="small">Mevcut kayıtlı: <span id="cur"></span></div>
+  <div class="small loading" id="scanStatus">Tarama yapılıyor...</div>
+  <button id="rescanBtn" style="margin-top:8px;padding:8px 10px;">Tekrar Tara</button>
+</div>
+<script>
+function populate(list){
+  const sel = document.getElementById('ssidList');
+  sel.innerHTML = '';
+  const emptyOpt = document.createElement('option');
+  emptyOpt.value = ''; emptyOpt.text = '-- SSID seçin veya manuel girin --';
+  sel.appendChild(emptyOpt);
+  list.forEach(function(item){
+    const o = document.createElement('option');
+    o.value = item.ssid;
+    o.text  = item.ssid + ' (' + item.rssi + ' dBm, ch ' + item.ch + ')';
+    sel.appendChild(o);
+  });
+}
+function fetchScan(){
+  document.getElementById('scanStatus').innerText = 'Tarama yapılıyor...';
+  fetch('/scan').then(r=>r.json()).then(js=>{
+    populate(js);
+    document.getElementById('scanStatus').innerText = 'Tarama tamamlandı. Ağ sayısı: ' + js.length;
+  }).catch(_=>{
+    document.getElementById('scanStatus').innerText = 'Tarama başarısız.';
+  });
+}
+document.getElementById('rescanBtn').addEventListener('click', function(e){ e.preventDefault(); fetchScan(); });
+fetch('/current').then(r=>r.text()).then(t=>{document.getElementById('cur').innerText = t;}).catch(()=>{});
+fetchScan();
+</script>
+</body></html>
+)rawliteral";
+
+// ---------- Handlers ----------
+void handleRoot() { portalServer.send(200, "text/html", portalPage); }
+void handleCurrent() {
+  String cur = savedSSID.length() ? savedSSID : "(yok)";
+  portalServer.send(200, "text/plain", cur);
+}
+void handleSave() {
+  if (portalServer.method() != HTTP_POST) { portalServer.send(405, "text/plain", "Method Not Allowed"); return; }
+  String ssid = portalServer.arg("ssid");
+  String manual = portalServer.arg("manual");
+  if (manual.length()) ssid = manual;
+  String pass = portalServer.arg("pass");
+  ssid.trim(); pass.trim();
+  if (ssid.length() == 0) { portalServer.send(400, "text/plain", "SSID boş olamaz"); return; }
+
+  saveCredentials(ssid, pass);
+  savedSSID = ssid; savedPASS = pass;
+
+  portalServer.send(200, "text/html",
+    "<html><body><h3>Kaydedildi. Cihaz yeni ağa bağlanmayı deniyor...</h3><p>Bu sayfayı kapatabilirsiniz.</p></body></html>");
+
+  Serial.println("[PORTAL] Yeni credentials alındı, bağlanma deneniyor...");
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+}
+
+// Captive: bulunamayan her isteği CAPTIVE_URL'e yönlendir
+void handleNotFound() {
+  portalServer.sendHeader("Location", CAPTIVE_URL, true);
+  portalServer.send(302, "text/plain", "");
+}
+
+// ---------- /scan: RSSI'ye göre sıralı JSON ----------
+void handleScan() {
+  Serial.println("[SCAN] Web istemcisinden tarama istendi.");
+  WiFi.mode(WIFI_AP_STA);   // AP açık kalırken STA ile tara
+  delay(50);
+
+#if defined(ESP32)
+  WiFi.scanDelete();
+  int n = WiFi.scanNetworks(false, true);
+#else
+  int n = WiFi.scanNetworks();
+#endif
+
+  const int MAXN = 50;
+  String ssids[MAXN]; int rssis[MAXN]; int chans[MAXN]; int encs[MAXN];
+  int m = 0;
+  for (int i=0; i<n && m<MAXN; i++) {
+    String s = WiFi.SSID(i); if (s.length() == 0) continue;
+    int r = WiFi.RSSI(i); int c = WiFi.channel(i);
+    int e = (int)WiFi.encryptionType(i);
+    bool found=false;
+    for (int k=0;k<m;k++){
+      if (ssids[k]==s){ found=true; if (r>rssis[k]){ rssis[k]=r; chans[k]=c; encs[k]=e; } break; }
+    }
+    if (!found){ ssids[m]=s; rssis[m]=r; chans[m]=c; encs[m]=e; m++; }
+  }
+  // RSSI azalan sırala
+  for (int i=0;i<m-1;i++) for (int j=i+1;j<m;j++)
+    if (rssis[j] > rssis[i]){
+      String ts=ssids[i]; ssids[i]=ssids[j]; ssids[j]=ts;
+      int tr=rssis[i]; rssis[i]=rssis[j]; rssis[j]=tr;
+      int tc=chans[i]; chans[i]=chans[j]; chans[j]=tc;
+      int te=encs[i];  encs[i]=encs[j];  encs[j]=te;
+    }
+
+  String out = "[";
+  for (int i=0;i<m;i++){
+    String s = ssids[i]; s.replace("\\","\\\\"); s.replace("\"","\\\"");
+    out += "{\"ssid\":\""+s+"\",\"rssi\":"+String(rssis[i])+",\"ch\":"+String(chans[i])+",\"enc\":"+String(encs[i])+"}";
+    if (i<m-1) out += ",";
+  }
+  out += "]";
+  portalServer.send(200, "application/json", out);
+}
+
+// ---------- AP başlat (her zaman, boot'ta) ----------
+bool startAP() {
+#if defined(ESP32)
+  WiFi.setSleep(false);
+#else
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
+  WiFi.mode(WIFI_AP_STA);            // AP ve STA aynı anda
+  delay(100);
+
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+
+  // Kanal 6 → olmazsa 1 → 11
+  const int chans[] = {6,1,11};
+  bool ok = false;
+  for (int i=0;i<3 && !ok;i++){
+    ok = WiFi.softAP(AP_SSID, AP_PASS, chans[i], /*hidden*/0, /*maxconn*/4);
+    Serial.print("[AP] softAP(): "); Serial.print(ok ? "OK" : "FAIL");
+    Serial.print(" on ch "); Serial.println(chans[i]);
+    if (!ok) delay(120);
+  }
+  if (!ok) return false;
+
+  // DNS wildcard (tüm domainler → AP IP)
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  // ----- Captive portal kontrol URL'leri (Android/iOS/Windows) → CAPTIVE_URL -----
+  portalServer.on("/generate_204", HTTP_ANY, [](){ // Android
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+  portalServer.on("/gen_204", HTTP_ANY, [](){      // Android varyant
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+  portalServer.on("/hotspot-detect.html", HTTP_ANY, [](){ // iOS/macOS
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+  portalServer.on("/library/test/success.html", HTTP_ANY, [](){ // iOS eski
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+  portalServer.on("/ncsi.txt", HTTP_ANY, [](){     // Windows
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+  portalServer.on("/connecttest.txt", HTTP_ANY, [](){ // Windows yeni
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+
+  // Web server routes
+  portalServer.on("/", HTTP_GET, handleRoot);
+  portalServer.on("/current", HTTP_GET, handleCurrent);
+  portalServer.on("/save", HTTP_POST, handleSave);
+  portalServer.on("/scan", HTTP_GET, handleScan);
+  portalServer.onNotFound(handleNotFound);
+  portalServer.begin();
+
+  Serial.println("[AP] Aktif.");
+  Serial.print("SSID : "); Serial.println(AP_SSID);
+  Serial.print("PASS : "); Serial.println(AP_PASS);
+  Serial.print("IP   : "); Serial.println(apIP);
+  Serial.println("[AP] Telefonda bu ağa bağlanın.");
+  Serial.print("[AP] Tarayıcı otomatik açılmadıysa "); Serial.print(CAPTIVE_URL);
+  Serial.println(" yazın (ör. http://wifi/).");
+  return true;
+}
+
+// ---------- STA ile bağlan ----------
+bool tryConnectSaved(uint32_t timeoutMs = 20000) {
+  if (!savedSSID.length()) return false;
+  Serial.print("[CONNECT] Kaydedilmiş SSID ile bağlanılıyor: "); Serial.println(savedSSID);
+
+  WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMs) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    String mac = WiFi.macAddress();
+    Serial.print("[OK] Bağlandı -> SSID: "); Serial.print(WiFi.SSID());
+    Serial.print(" | IP: ");                Serial.print(WiFi.localIP());
+    Serial.print(" | MAC: ");               Serial.println(mac);
+    String serialID = "ESP-" + mac; serialID.replace(":", "");
+    Serial.print("Seri No: "); Serial.println(serialID);
+    Serial.println("---------------------------------------");
+
+    // Güvenlik için AP'yi kapat (AP açık kalsın istersen alt satırı yorumla)
+    WiFi.softAPdisconnect(true);
+
+    // Servo'yu şimdi başlat
+    if (!servoReady) {
+      servo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+      servo.write(g_servoAngle);
+      servoReady = true;
+    }
+    return true;
+  }
+  Serial.println("[FAIL] Kaydedilmiş SSID ile bağlanılamadı.");
+  return false;
+}
+
+// ---------- Internet kontrolü ----------
+static bool checkInternet() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure sclient; sclient.setInsecure();
+  HTTPClient http;
+  const char* url = "https://clients3.google.com/generate_204";
+  http.setTimeout(4000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(sclient, url)) return false;
+  int code = http.GET();
+  http.end();
+  return (code >= 200 && code < 400);
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(BAUDRATE);
+  delay(150);
+
+  Serial.println();
+  Serial.println("[BOOT] Başlıyor...");
+
+  // 1) Her zaman AP'yi başlat (kullanıcı formu için)
+  bool apOk = startAP();
+  if (!apOk) Serial.println("[AP] Başlatılamadı! Güç/kapsama sorunu olabilir.");
+
+  // 2) Kayıtlı SSID varsa arka planda bağlanmayı dene (AP açık kalır)
+  bool hasSaved = loadCredentials();
+  if (hasSaved) tryConnectSaved(15000);
+}
+
+// ---------- Loop ----------
+void loop() {
+  unsigned long now = millis();
+
+  // Portal servisleri
+  dnsServer.processNextRequest();
+  portalServer.handleClient();
+
+  // Bağlı değilse periyodik yeniden dene (AP açık kalmaya devam eder)
+  if (WiFi.status() != WL_CONNECTED && savedSSID.length()) {
+    static unsigned long t_lastRetry = 0;
+    if (now - t_lastRetry > 10000) {
+      t_lastRetry = now;
+      Serial.println("[RETRY] STA yeniden deneniyor...");
+      tryConnectSaved(8000);
+    }
+  } else {
+    // Bağlıyken internet durumu
+    if (now - t_lastNet >= NET_CHECK_INTERVAL_MS) {
+      t_lastNet = now;
+      g_netOK = checkInternet();
+    }
+  }
+
+  // Servo demo (bağlandıktan sonra aktif)
+  if (servoReady && (now - t_lastServo >= SERVO_STEP_INTERVAL_MS)) {
+    t_lastServo = now;
+    static int phase = 0;
+    switch (phase) {
+      case 0: g_servoAngle = 0;   break;
+      case 1: g_servoAngle = 90;  break;
+      case 2: g_servoAngle = 180; break;
+      case 3: g_servoAngle = 90;  break;
+    }
+    phase = (phase + 1) & 0x03;
+    servo.write(clamp(g_servoAngle, 0, 180));
+  }
+
+  // Serial Plotter verisi
+  if (now - t_lastPlot >= PLOT_INTERVAL_MS) {
+    t_lastPlot = now;
+    int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -100;
+    plotLine(g_servoAngle, rssi, g_netOK ? 1 : 0);
+  }
+}

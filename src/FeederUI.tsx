@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Wifi, WifiOff, Activity, Settings, Calendar, Shield, Network, Scale, Clock, Plus, Trash2, Edit2, Save, X, Zap, Timer, PawPrint, Code, RefreshCw } from 'lucide-react';
+import { Wifi, WifiOff, Activity, Settings, Calendar, Shield, Network, Scale, Clock, Plus, Trash2, Edit2, Save, X, Zap, Timer, PawPrint, Code, RefreshCw, FileText } from 'lucide-react';
 
 const ANIMAL_TYPES = {
   dog_small: { name: 'Köpek (Küçük)', icon: '🐕', portion: 150, duration: 8000 },
@@ -58,6 +58,13 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
   const [pageSize, setPageSize] = useState(5);
   const [syncingDeviceId, setSyncingDeviceId] = useState<string | null>(null);
   const [deviceCodeTab, setDeviceCodeTab] = useState<'esp8266' | 'raspberry'>('esp8266');
+  const [logs, setLogs] = useState<any[]>([]);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logLevel, setLogLevel] = useState('');
+  const [logQuery, setLogQuery] = useState('');
+  const [logSinceMinutes, setLogSinceMinutes] = useState(1440);
+  const logsIntervalRef = useRef<number | null>(null);
+  const [logsTick, setLogsTick] = useState(0);
 
   // Calendar state
   const [schedules, setSchedules] = useState([
@@ -212,6 +219,37 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
     };
     loadDevices();
   }, [showAllDevices]);
+
+  useEffect(() => {
+    const loadLogs = async () => {
+      if (!selectedDeviceId || activeTab !== 'logs') return;
+      setLogsLoading(true);
+      try {
+        const qs = new URLSearchParams();
+        if (logLevel) qs.append('level', logLevel);
+        if (logQuery) qs.append('q', logQuery);
+        if (logSinceMinutes) qs.append('sinceMinutes', String(logSinceMinutes));
+        qs.append('limit', '200');
+        const res = await fetch(`/devices/${selectedDeviceId}/logs?${qs.toString()}`, { headers: { 'Authorization': `Bearer ${token}` }, cache: 'no-store' });
+        if (res.ok) {
+          const data = await res.json();
+          setLogs(Array.isArray(data) ? data : []);
+        }
+      } catch {}
+      finally { setLogsLoading(false); }
+    };
+    loadLogs();
+    if (logsIntervalRef.current) window.clearInterval(logsIntervalRef.current);
+    if (activeTab === 'logs' && selectedDeviceId) {
+      logsIntervalRef.current = window.setInterval(loadLogs, 5000) as any;
+    }
+    return () => {
+      if (logsIntervalRef.current) {
+        window.clearInterval(logsIntervalRef.current);
+        logsIntervalRef.current = null;
+      }
+    };
+  }, [activeTab, selectedDeviceId, logLevel, logQuery, logSinceMinutes, logsTick]);
 
   // Fetch settings and start status polling when device changes
   useEffect(() => {
@@ -675,6 +713,18 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
           </button>
 
           <button
+            onClick={() => { setActiveTab('logs'); }}
+            className={`flex items-center gap-2 px-6 py-3 rounded-lg font-semibold transition-all whitespace-nowrap ${
+              activeTab === 'logs'
+                ? 'bg-gradient-to-r from-blue-600 to-blue-700 text-white shadow-lg shadow-blue-600/50'
+                : 'bg-slate-800/50 text-slate-300 hover:bg-slate-700/50 border border-slate-700'
+            }`}
+          >
+            <FileText className="w-5 h-5" />
+            Loglar
+          </button>
+
+          <button
             onClick={() => { setActiveTab('pin-map'); }}
             className={`flex items-center gap-2 px-6 py-3 rounded-lg font-semibold transition-all whitespace-nowrap ${
               activeTab === 'pin-map'
@@ -686,6 +736,85 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
             Pin Haritası
           </button>
         </div>
+
+        {/* Logs Panel */}
+        {activeTab === 'logs' && (
+          <div className="space-y-6">
+            <div className="bg-gradient-to-br from-slate-800/80 to-slate-700/80 backdrop-blur-sm rounded-xl p-6 border border-slate-600">
+              <h3 className="text-white text-xl font-semibold mb-4 flex items-center gap-2">
+                <FileText className="w-5 h-5 text-blue-400" />
+                Cihaz Logları
+              </h3>
+
+              {!selectedDeviceId ? (
+                <div className="bg-amber-900/20 border border-amber-600/30 rounded-lg p-4 text-center text-amber-200">
+                  Lütfen bir cihaz seçin.
+                </div>
+              ) : (
+                <>
+                  <div className="flex flex-wrap items-end gap-3 mb-4">
+                    <div>
+                      <label className="block text-slate-300 text-sm mb-1">Seviye</label>
+                      <select value={logLevel} onChange={(e) => setLogLevel(e.target.value)} className="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                        <option value="">Tümü</option>
+                        <option value="debug">debug</option>
+                        <option value="info">info</option>
+                        <option value="warn">warn</option>
+                        <option value="error">error</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-slate-300 text-sm mb-1">Arama</label>
+                      <input value={logQuery} onChange={(e) => setLogQuery(e.target.value)} placeholder="mesaj içinde ara" className="w-64 bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm placeholder-slate-400" />
+                    </div>
+                    <div>
+                      <label className="block text-slate-300 text-sm mb-1">Zaman</label>
+                      <select value={logSinceMinutes} onChange={(e) => setLogSinceMinutes(Number(e.target.value))} className="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm">
+                        <option value={60}>Son 1 saat</option>
+                        <option value={360}>Son 6 saat</option>
+                        <option value={1440}>Son 24 saat</option>
+                        <option value={10080}>Son 7 gün</option>
+                      </select>
+                    </div>
+                    <button onClick={() => setLogsTick(v => v + 1)} className="px-3 py-2 rounded bg-slate-700 text-white text-sm hover:bg-slate-600">Yenile</button>
+                    {logsLoading && <span className="text-slate-300 text-sm">Yükleniyor...</span>}
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full text-sm">
+                      <thead>
+                        <tr className="text-left text-slate-300 border-b border-slate-600/50">
+                          <th className="py-2 pr-4">Zaman</th>
+                          <th className="py-2 pr-4">Seviye</th>
+                          <th className="py-2 pr-4">Mesaj</th>
+                          <th className="py-2 pr-4">Meta</th>
+                        </tr>
+                      </thead>
+                      <tbody className="text-slate-200">
+                        {logs.length === 0 ? (
+                          <tr><td colSpan={4} className="py-3 text-center text-slate-400">Kayıt yok</td></tr>
+                        ) : logs.map((lg: any) => (
+                          <tr key={lg.id} className="border-b border-slate-700/40">
+                            <td className="py-2 pr-4 whitespace-nowrap">{new Date(lg.created_at || '').toLocaleString()}</td>
+                            <td className="py-2 pr-4"><span className={`px-2 py-0.5 rounded text-xs ${
+                              lg.level === 'error' ? 'bg-red-800/40 text-red-200' :
+                              lg.level === 'warn' ? 'bg-amber-800/40 text-amber-200' :
+                              lg.level === 'debug' ? 'bg-slate-800/60 text-slate-300' : 'bg-green-800/40 text-green-200'
+                            }`}>{lg.level}</span></td>
+                            <td className="py-2 pr-4 text-slate-100">{lg.message}</td>
+                            <td className="py-2 pr-4 text-xs text-slate-300 font-mono max-w-[360px] overflow-hidden text-ellipsis">
+                              {lg.meta ? (typeof lg.meta === 'string' ? lg.meta : JSON.stringify(lg.meta)) : '-'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Dashboard Panel */}
         {activeTab === 'dashboard' && (
@@ -1265,184 +1394,144 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
               {/* Motor & Servo Settings */}
               {activeTab === 'settings' && activeSubTab === 'motor' && (
                 <div className="space-y-5">
-                  <div className="bg-amber-900/20 border border-amber-600/30 rounded-lg p-4 mb-4">
+                  <div className="bg-amber-900/20 border border-amber-600/30 rounded-lg p-4">
                     <p className="text-amber-300 text-sm flex items-center gap-2">
                       <Zap className="w-4 h-4" />
                       <strong>Uyarı:</strong> Motor ve servo hızlarını değiştirirken dikkatli olun. Yüksek hızlar mekanik hasara neden olabilir.
                     </p>
                   </div>
 
-                  <div>
-                    <label className="block text-white font-semibold mb-3 flex items-center gap-3">
-                      <div className="flex items-center gap-2">
-                        <input type="checkbox" checked={(formData as any).servoEnabled ?? true} onChange={(e) => setFormData((prev: any) => ({ ...prev, servoEnabled: e.target.checked }))} className="w-4 h-4 accent-blue-600" />
-                        <Zap className="w-4 h-4" />
-                        Servo Hızı (PWM)
-                      </div>
-                    </label>
-                    <div className="space-y-3">
-                      <input
-                        type="range"
-                        name="servoSpeed"
-                        min={10}
-                        max={100}
-                        step={5}
-                        value={(formData as any).servoSpeed || 50}
-                        onChange={handleInputChange}
-                        disabled={!((formData as any).servoEnabled ?? true)}
-                        className={`w-full h-2 rounded-lg appearance-none cursor-pointer accent-blue-600 ${((formData as any).servoEnabled ?? true) ? 'bg-slate-700' : 'bg-slate-800/50 opacity-50 cursor-not-allowed'}`}
+                  {/* Servo Motor */}
+                  <div className="bg-slate-700/30 border border-slate-600 rounded-lg p-5">
+                    <label className="flex items-center gap-3 mb-4 cursor-pointer">
+                      <input 
+                        type="checkbox" 
+                        checked={(formData as any).servoEnabled ?? true} 
+                        onChange={(e) => setFormData((prev: any) => ({ ...prev, servoEnabled: e.target.checked }))} 
+                        className="w-5 h-5 accent-blue-600" 
                       />
-                      <div className="flex justify-between items-center">
-                        <span className="text-slate-400 text-sm">Yavaş (10%)</span>
-                        <span className="text-white text-lg font-bold">{(formData as any).servoSpeed}%</span>
-                        <span className="text-slate-400 text-sm">Hızlı (100%)</span>
+                      <div className="flex items-center gap-2">
+                        <Zap className="w-5 h-5 text-blue-400" />
+                        <span className="text-white font-semibold text-lg">Servo Motor (Kapak Kontrolü)</span>
                       </div>
-                    </div>
-                    <p className="text-slate-400 text-sm mt-3">
-                      Kapak açılma/kapanma hızını kontrol eder (MG996/SG90 servo)
-                    </p>
-                  </div>
-
-                  <div>
-                    <label className="block text-white font-semibold mb-3 flex items-center gap-2">
-                      <Timer className="w-4 h-4" />
-                      Motor Hızı (Yem Akış)
                     </label>
-                    <div className="grid md:grid-cols-2 gap-6">
-                      {/* DC Motor */}
-                      <div>
-                        <label className="flex items-center gap-2 mb-2 text-slate-200 text-sm cursor-pointer">
+                    
+                    {((formData as any).servoEnabled ?? true) && (
+                      <>
+                        <div className="space-y-3 mt-4">
                           <input
-                            type="checkbox"
-                            checked={(formData as any).motorDCEnabled ?? true}
-                            onChange={(e) => setFormData((prev: any) => ({ ...prev, motorDCEnabled: e.target.checked, motorStepEnabled: e.target.checked ? false : (prev.motorStepEnabled ?? false), motorType: e.target.checked ? 'DC Motor' : ((prev.motorStepEnabled ?? false) ? 'Step Motor' : 'DC Motor') }))}
-                            className="w-4 h-4 accent-green-600"
+                            type="range"
+                            name="servoSpeed"
+                            min={10}
+                            max={100}
+                            step={5}
+                            value={(formData as any).servoSpeed || 50}
+                            onChange={handleInputChange}
+                            className="w-full h-3 rounded-lg appearance-none cursor-pointer accent-blue-600 bg-slate-700"
                           />
-                          DC Motor
-                        </label>
-                        <input
-                          type="range"
-                          name="motorSpeed"
-                          min={10}
-                          max={100}
-                          step={5}
-                          value={(formData as any).motorSpeed || 75}
-                          onChange={handleInputChange}
-                          disabled={!((formData as any).motorDCEnabled ?? true)}
-                          className={`w-full h-2 rounded-lg appearance-none cursor-pointer accent-green-600 ${((formData as any).motorDCEnabled ?? true) ? 'bg-slate-700' : 'bg-slate-800/50 opacity-50 cursor-not-allowed'}`}
-                        />
-                        <div className="flex justify-between items-center mt-1">
-                          <span className="text-slate-400 text-sm">Yavaş (10%)</span>
-                          <span className="text-white text-lg font-bold">{(formData as any).motorSpeed}%</span>
-                          <span className="text-slate-400 text-sm">Hızlı (100%)</span>
+                          <div className="flex justify-between items-center">
+                            <span className="text-slate-400 text-sm">Yavaş (10%)</span>
+                            <span className="text-white text-xl font-bold">{(formData as any).servoSpeed}%</span>
+                            <span className="text-slate-400 text-sm">Hızlı (100%)</span>
+                          </div>
                         </div>
-                      </div>
-
-                      {/* Step Motor */}
-                      <div>
-                        <label className="flex items-center gap-2 mb-2 text-slate-200 text-sm cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={(formData as any).motorStepEnabled ?? false}
-                            onChange={(e) => setFormData((prev: any) => ({ ...prev, motorStepEnabled: e.target.checked, motorDCEnabled: e.target.checked ? false : (prev.motorDCEnabled ?? true), motorType: e.target.checked ? 'Step Motor' : ((prev.motorDCEnabled ?? true) ? 'DC Motor' : 'Step Motor') }))}
-                            className="w-4 h-4 accent-purple-600"
-                          />
-                          Step Motor
-                        </label>
-                        <input
-                          type="range"
-                          name="stepperSpeed"
-                          min={10}
-                          max={100}
-                          step={5}
-                          value={(formData as any).stepperSpeed || 60}
-                          onChange={handleInputChange}
-                          disabled={!((formData as any).motorStepEnabled ?? false)}
-                          className={`w-full h-2 rounded-lg appearance-none cursor-pointer accent-purple-600 ${((formData as any).motorStepEnabled ?? false) ? 'bg-slate-700' : 'bg-slate-800/50 opacity-50 cursor-not-allowed'}`}
-                        />
-                        <div className="flex justify-between items-center mt-1">
-                          <span className="text-slate-400 text-sm">Yavaş (10%)</span>
-                          <span className="text-white text-lg font-bold">{(formData as any).stepperSpeed || 60}%</span>
-                          <span className="text-slate-400 text-sm">Hızlı (100%)</span>
-                        </div>
-                      </div>
-                    </div>
-                    <p className="text-slate-400 text-sm mt-3">
-                      Yem dağıtım motor hızını kontrol eder (DC Motor / Step Motor)
-                    </p>
+                        <p className="text-slate-400 text-sm mt-3">
+                          Kapak açılma/kapanma hızını kontrol eder (MG996R/SG90 servo motor)
+                        </p>
+                      </>
+                    )}
                   </div>
 
-                  {((formData as any).motorStepEnabled ?? false) && (
-                    <div>
-                      <label className="block text-white font-semibold mb-3 flex items-center gap-2">
-                        <Zap className="w-4 h-4" />
-                        Step Motor Hızı
-                      </label>
-                      <div className="space-y-3">
-                        <input
-                          type="range"
-                          name="stepperSpeed"
-                          min={10}
-                          max={100}
-                          step={5}
-                          value={(formData as any).stepperSpeed || 60}
-                          onChange={handleInputChange}
-                          className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-600"
-                        />
-                        <div className="flex justify-between items-center">
-                          <span className="text-slate-400 text-sm">Yavaş (10%)</span>
-                          <span className="text-white text-lg font-bold">{(formData as any).stepperSpeed || 60}%</span>
-                          <span className="text-slate-400 text-sm">Hızlı (100%)</span>
-                        </div>
+                  {/* DC Motor */}
+                  <div className="bg-slate-700/30 border border-slate-600 rounded-lg p-5">
+                    <label className="flex items-center gap-3 mb-4 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={(formData as any).motorDCEnabled ?? true}
+                        onChange={(e) => setFormData((prev: any) => ({ 
+                          ...prev, 
+                          motorDCEnabled: e.target.checked, 
+                          motorStepEnabled: e.target.checked ? false : (prev.motorStepEnabled ?? false), 
+                          motorType: e.target.checked ? 'DC Motor' : ((prev.motorStepEnabled ?? false) ? 'Step Motor' : 'DC Motor') 
+                        }))}
+                        className="w-5 h-5 accent-green-600"
+                      />
+                      <div className="flex items-center gap-2">
+                        <Timer className="w-5 h-5 text-green-400" />
+                        <span className="text-white font-semibold text-lg">DC Motor (Yem Akışı)</span>
                       </div>
-                      <p className="text-slate-400 text-sm mt-3">
-                        Step motorlar için hız, adım/saniye olarak normalize edilmiştir.
-                      </p>
-                    </div>
-                  )}
+                    </label>
+                    
+                    {((formData as any).motorDCEnabled ?? true) && (
+                      <>
+                        <div className="space-y-3 mt-4">
+                          <input
+                            type="range"
+                            name="motorSpeed"
+                            min={10}
+                            max={100}
+                            step={5}
+                            value={(formData as any).motorSpeed || 75}
+                            onChange={handleInputChange}
+                            className="w-full h-3 rounded-lg appearance-none cursor-pointer accent-green-600 bg-slate-700"
+                          />
+                          <div className="flex justify-between items-center">
+                            <span className="text-slate-400 text-sm">Yavaş (10%)</span>
+                            <span className="text-white text-xl font-bold">{(formData as any).motorSpeed}%</span>
+                            <span className="text-slate-400 text-sm">Hızlı (100%)</span>
+                          </div>
+                        </div>
+                        <p className="text-slate-400 text-sm mt-3">
+                          Yem dağıtım hızını kontrol eder (DC motor ile döner mekanizma)
+                        </p>
+                      </>
+                    )}
+                  </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="bg-slate-700/30 border border-slate-600 rounded-lg p-4">
-                      <h4 className="text-white font-semibold mb-3 flex items-center gap-2">
-                        <Activity className="w-4 h-4 text-blue-400" />
-                        Servo Durumu
-                      </h4>
-                      <div className="space-y-2 text-sm">
-                        <div className="flex justify-between">
-                          <span className="text-slate-400">Hız:</span>
-                          <span className="text-white font-medium">{(formData as any).servoSpeed}%</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-400">Durum:</span>
-                          <span className="text-green-400 font-medium">● Hazır</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-400">Pin:</span>
-                          <span className="text-white font-medium">GPIO 18</span>
-                        </div>
+                  {/* Step Motor */}
+                  <div className="bg-slate-700/30 border border-slate-600 rounded-lg p-5">
+                    <label className="flex items-center gap-3 mb-4 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={(formData as any).motorStepEnabled ?? false}
+                        onChange={(e) => setFormData((prev: any) => ({ 
+                          ...prev, 
+                          motorStepEnabled: e.target.checked, 
+                          motorDCEnabled: e.target.checked ? false : (prev.motorDCEnabled ?? true), 
+                          motorType: e.target.checked ? 'Step Motor' : ((prev.motorDCEnabled ?? true) ? 'DC Motor' : 'Step Motor') 
+                        }))}
+                        className="w-5 h-5 accent-purple-600"
+                      />
+                      <div className="flex items-center gap-2">
+                        <Zap className="w-5 h-5 text-purple-400" />
+                        <span className="text-white font-semibold text-lg">Step Motor (28BYJ-48)</span>
                       </div>
-                    </div>
-
-                    <div className="bg-slate-700/30 border border-slate-600 rounded-lg p-4">
-                      <h4 className="text-white font-semibold mb-3 flex items-center gap-2">
-                        <Zap className="w-4 h-4 text-green-400" />
-                        Motor Durumu
-                      </h4>
-                      <div className="space-y-2 text-sm">
-                        <div className="flex justify-between">
-                          <span className="text-slate-400">Hız:</span>
-                          <span className="text-white font-medium">{(formData as any).motorSpeed}%</span>
+                    </label>
+                    
+                    {((formData as any).motorStepEnabled ?? false) && (
+                      <>
+                        <div className="space-y-3 mt-4">
+                          <input
+                            type="range"
+                            name="stepperSpeed"
+                            min={10}
+                            max={100}
+                            step={5}
+                            value={(formData as any).stepperSpeed || 60}
+                            onChange={handleInputChange}
+                            className="w-full h-3 rounded-lg appearance-none cursor-pointer accent-purple-600 bg-slate-700"
+                          />
+                          <div className="flex justify-between items-center">
+                            <span className="text-slate-400 text-sm">Yavaş (10%)</span>
+                            <span className="text-white text-xl font-bold">{(formData as any).stepperSpeed || 60}%</span>
+                            <span className="text-slate-400 text-sm">Hızlı (100%)</span>
+                          </div>
                         </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-400">Durum:</span>
-                          <span className="text-green-400 font-medium">● Hazır</span>
-                        </div>
-                        <div className="flex justify-between">
-                          <span className="text-slate-400">Tip:</span>
-                          <span className="text-white font-medium">{(formData as any).motorType || 'DC Motor'}</span>
-                        </div>
-                      </div>
-                    </div>
+                        <p className="text-slate-400 text-sm mt-3">
+                          Step motor hızı (adım/saniye olarak normalize edilmiştir)
+                        </p>
+                      </>
+                    )}
                   </div>
 
                   <div className="bg-blue-900/20 border border-blue-600/30 rounded-lg p-4">
@@ -1452,12 +1541,6 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
                       <p>• <strong>Tavuk/Kuş:</strong> Servo: 60%, Motor: 60%</p>
                       <p>• <strong>Hassas Dozaj:</strong> Motor hızını düşürün (40-50%)</p>
                     </div>
-                  </div>
-
-                  <div className="flex justify-end">
-                    <button onClick={handleSaveSettings} className="mt-2 bg-green-600 hover:bg-green-500 text-white px-4 py-2 rounded-lg">
-                      Kaydet
-                    </button>
                   </div>
                 </div>
               )}

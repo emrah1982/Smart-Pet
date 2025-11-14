@@ -1,0 +1,229 @@
+/*
+  Plotter-Ready + WiFi Teşhis (Scan + Connect)
+  - ESP32 (WeMos D1 R32) ve ESP8266 destekli
+  - Arduino IDE Serial Plotter: 115200 baud
+  - Çıktı (aynı satır, 3 eğri): "ServoAngle:90 RSSI:-62 InternetOK:1"
+*/
+
+#if defined(ESP8266)
+  #include <ESP8266WiFi.h>
+  #include <ESP8266HTTPClient.h>
+  #include <Servo.h>
+#elif defined(ESP32)
+  #include <WiFi.h>
+  #include <HTTPClient.h>
+  #include <ESP32Servo.h>   // Library Manager: ESP32Servo
+#else
+  #error "Only ESP8266 or ESP32 is supported."
+#endif
+
+#include <WiFiClientSecure.h>
+
+// ---------- Kullanıcı Ayarları ----------
+#define BAUDRATE               115200
+#define PLOT_INTERVAL_MS        500   // 0.5 sn
+#define NET_CHECK_INTERVAL_MS  5000   // 5 sn
+#define SERVO_STEP_INTERVAL_MS 1000   // 1 sn
+#define SERVO_MIN_US             500
+#define SERVO_MAX_US            2400
+
+// Çoklu SSID (öncelik sırası yukarıdan aşağıya)
+const char* SSID_LIST[] = {
+  //"vivo Y35",
+  "TurkTelekom_T2579"         // ← ev internetinizin SSID'sini buraya yazın (2.4 GHz)
+  //"Feeder_AP"
+};
+
+const char* PASSWORD_LIST[] = {
+  //"emrah123*'?.,",
+  "aLwQ4MxZ"       // ← ev interneti şifre  
+  //"fEEd_ME.199!"
+};
+
+const uint8_t NUM_SSID = sizeof(SSID_LIST) / sizeof(SSID_LIST[0]);
+
+// ---------- Global ----------
+#if defined(ESP32)
+  const uint8_t SERVO_PIN = 18;  // ESP32 için güvenli PWM pinler: 5,18,19,21,22,23
+#else
+  const uint8_t SERVO_PIN = D5;  // ESP8266: GPIO14 (D5)
+#endif
+
+Servo servo;
+int   g_servoAngle = 90;
+bool  g_netOK      = false;
+
+unsigned long t_lastPlot  = 0;
+unsigned long t_lastNet   = 0;
+unsigned long t_lastServo = 0;
+
+// ---------- Yardımcılar ----------
+static inline void plotLine(int servoAngle, int rssi, int internetOK) {
+  Serial.print("ServoAngle:"); Serial.print(servoAngle);
+  Serial.print(" RSSI:");      Serial.print(rssi);
+  Serial.print(" InternetOK:");Serial.println(internetOK);
+}
+
+static inline int clamp(int v, int lo, int hi){ return (v<lo)?lo:((v>hi)?hi:v); }
+
+static void printEncType(int enc) {
+#if defined(ESP32)
+  switch (enc) {
+    case WIFI_AUTH_OPEN:           Serial.print("OPEN"); break;
+    case WIFI_AUTH_WEP:            Serial.print("WEP"); break;
+    case WIFI_AUTH_WPA_PSK:        Serial.print("WPA"); break;
+    case WIFI_AUTH_WPA2_PSK:       Serial.print("WPA2"); break;
+    case WIFI_AUTH_WPA_WPA2_PSK:   Serial.print("WPA/WPA2"); break;
+    case WIFI_AUTH_WPA2_ENTERPRISE:Serial.print("WPA2-ENT"); break;
+    case WIFI_AUTH_WPA3_PSK:       Serial.print("WPA3"); break;
+    case WIFI_AUTH_WPA2_WPA3_PSK:  Serial.print("WPA2/WPA3"); break;
+    default:                       Serial.print(enc); break;
+  }
+#else
+  Serial.print(enc);
+#endif
+}
+
+static void scanAndReport() {
+  Serial.println("\n[SCAN] WiFi ağları taranıyor...");
+#if defined(ESP32)
+  WiFi.scanDelete();
+  int n = WiFi.scanNetworks(false, true);
+#else
+  int n = WiFi.scanNetworks();
+#endif
+  if (n <= 0) { Serial.println("[SCAN] Ağ bulunamadı."); return; }
+
+  for (int i = 0; i < n; i++) {
+    Serial.print("  - SSID: "); Serial.print(WiFi.SSID(i));
+    Serial.print(" | RSSI: ");  Serial.print(WiFi.RSSI(i));
+    Serial.print(" dBm | CH: ");Serial.print(WiFi.channel(i));
+    Serial.print(" | ENC: ");   printEncType(WiFi.encryptionType(i));
+    Serial.println();
+  }
+  Serial.println("[SCAN] Bitti.\n");
+}
+
+// ---------- Bağlantı Deneme ----------
+static bool tryConnectSequential(uint32_t perApMs = 20000) {
+#if defined(ESP32)
+  WiFi.setSleep(false);
+#endif
+  WiFi.mode(WIFI_STA);
+
+  scanAndReport();
+
+#if defined(ESP32)
+  WiFi.scanDelete();
+  int n = WiFi.scanNetworks(false, true);
+#else
+  int n = WiFi.scanNetworks();
+#endif
+
+  for (uint8_t idx = 0; idx < NUM_SSID; ++idx) {
+    bool present = false;
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == SSID_LIST[idx]) { present = true; break; }
+    }
+    Serial.print("[CONNECT] Denenecek SSID: "); Serial.print(SSID_LIST[idx]);
+    if (!present) Serial.print(" (tarama listesinde görülmedi)");
+    Serial.println();
+
+    WiFi.begin(SSID_LIST[idx], PASSWORD_LIST[idx]);
+
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - t0) < perApMs) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      String mac = WiFi.macAddress();
+      Serial.print("[OK] Bağlandı -> SSID: "); Serial.print(WiFi.SSID());
+      Serial.print(" | IP: ");                Serial.print(WiFi.localIP());
+      Serial.print(" | MAC: ");               Serial.println(mac);
+
+      // MAC adresinden seri numarası oluştur (örnek: ESP32-246F289AB27F)
+      String serialID = "ESP-" + mac;
+      serialID.replace(":", "");
+      Serial.print("Seri No: "); Serial.println(serialID);
+      Serial.println("---------------------------------------");
+
+      return true;
+    } else {
+      Serial.println("[FAIL] Bağlanamadı, sıradakine geçiliyor.\n");
+      WiFi.disconnect(true, true);
+      delay(300);
+    }
+  }
+  return false;
+}
+
+// ---------- İnternet Testi ----------
+static bool checkInternet() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure sclient;
+  sclient.setInsecure();
+  HTTPClient http;
+  const char* url = "https://clients3.google.com/generate_204";
+  http.setTimeout(4000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(sclient, url)) return false;
+  int code = http.GET();
+  http.end();
+  return (code >= 200 && code < 400);
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(BAUDRATE);
+  delay(100);
+
+  Serial.println("\n[BOOT] WiFi’ye bağlanma deneniyor (sırayla)...");
+  bool ok = tryConnectSequential(20000);
+  if (!ok) {
+    Serial.println("[BOOT] Bağlanamadı! SSID, şifre, 2.4 GHz ve WPA2 ayarlarını kontrol edin.");
+  }
+
+  servo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  servo.write(g_servoAngle);
+}
+
+// ---------- Loop ----------
+void loop() {
+  unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long t_lastRetry = 0;
+    if (now - t_lastRetry > 10000) {
+      t_lastRetry = now;
+      Serial.println("[RETRY] WiFi yeniden deneniyor...");
+      tryConnectSequential(10000);
+    }
+  }
+
+  if (now - t_lastNet >= NET_CHECK_INTERVAL_MS) {
+    t_lastNet = now;
+    g_netOK = checkInternet();
+  }
+
+  if (now - t_lastServo >= SERVO_STEP_INTERVAL_MS) {
+    t_lastServo = now;
+    static int phase = 0;
+    switch (phase) {
+      case 0: g_servoAngle = 0;   break;
+      case 1: g_servoAngle = 90;  break;
+      case 2: g_servoAngle = 180; break;
+      case 3: g_servoAngle = 90;  break;
+    }
+    phase = (phase + 1) & 0x03;
+    servo.write(clamp(g_servoAngle, 0, 180));
+  }
+
+  if (now - t_lastPlot >= PLOT_INTERVAL_MS) {
+    t_lastPlot = now;
+    int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -100;
+    plotLine(g_servoAngle, rssi, g_netOK ? 1 : 0);
+  }
+}
