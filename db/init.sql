@@ -178,6 +178,19 @@ CREATE TABLE IF NOT EXISTS security_settings (
   UNIQUE KEY uq_security_device (device_id)
 );
 
+-- Device logs (Arduino & UI)
+CREATE TABLE IF NOT EXISTS device_logs (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  device_id INT NOT NULL,
+  level VARCHAR(16) NOT NULL DEFAULT 'info',
+  message TEXT NOT NULL,
+  meta JSON NULL,
+  created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_device_logs_device FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE,
+  INDEX idx_device_logs_device (device_id),
+  INDEX idx_device_logs_created (created_at)
+);
+
 INSERT INTO users (email, password_hash, display_name)
 SELECT 'demo@example.com', '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', 'Demo User'
 WHERE NOT EXISTS (SELECT 1 FROM users);
@@ -199,6 +212,13 @@ SELECT u.id, 'Feeder-Garaj', 'C3D4E5F6', '192.168.1.52', 80, 'esp8266_wemos_d1'
 FROM users u
 WHERE u.email = 'demo@example.com'
 AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.user_id = u.id AND d.name = 'Feeder-Garaj');
+
+-- Extra demo device for Freeder-Demo with custom serial/MAC "A1B2C3D4xs"
+INSERT INTO devices (user_id, name, serial, esp_host, esp_port, model)
+SELECT u.id, 'Freeder-Demo', 'A1B2C3D4xs', '192.168.1.50', 80, 'esp8266_wemos_d1'
+FROM users u
+WHERE u.email = 'demo@example.com'
+AND NOT EXISTS (SELECT 1 FROM devices d WHERE d.user_id = u.id AND d.serial = 'A1B2C3D4xs');
 
 -- Optional demo Raspberry Pi Zero W device
 INSERT INTO devices (user_id, name, serial, esp_host, esp_port, model)
@@ -343,6 +363,68 @@ INSERT INTO security_settings (device_id, api_token, allow_remote)
 SELECT d.id, NULL, 0 FROM devices d
 JOIN users u ON u.id = d.user_id AND u.email = 'demo@example.com'
 WHERE NOT EXISTS (SELECT 1 FROM security_settings ss WHERE ss.device_id = d.id);
+
+-- Demo seed logs similar to Arduino postLog payloads
+INSERT INTO device_logs (device_id, level, message, meta, created_at)
+SELECT d.id, 'info', 'Feeding allowed by schedule',
+       JSON_OBJECT('duration_ms', 8000, 'reason', 'seed_demo', 'source', 'init.sql'),
+       NOW() - INTERVAL 30 MINUTE
+FROM devices d
+JOIN users u ON u.id = d.user_id AND u.email = 'demo@example.com'
+WHERE d.name = 'Feeder-Demo'
+  AND NOT EXISTS (
+    SELECT 1 FROM device_logs dl
+    WHERE dl.device_id = d.id AND dl.message = 'Feeding allowed by schedule'
+  );
+
+INSERT INTO device_logs (device_id, level, message, meta, created_at)
+SELECT d.id, 'info', 'FEED_EXECUTED',
+       JSON_OBJECT('duration_ms', 8000, 'portion', 300, 'source', 'init.sql'),
+       NOW() - INTERVAL 25 MINUTE
+FROM devices d
+JOIN users u ON u.id = d.user_id AND u.email = 'demo@example.com'
+WHERE d.name = 'Feeder-Demo'
+  AND NOT EXISTS (
+    SELECT 1 FROM device_logs dl
+    WHERE dl.device_id = d.id AND dl.message = 'FEED_EXECUTED'
+  );
+
+INSERT INTO device_logs (device_id, level, message, meta, created_at)
+SELECT d.id, 'warn', 'Feeding skipped due to cooldown',
+       JSON_OBJECT('cooldown_minutes', 2, 'source', 'init.sql'),
+       NOW() - INTERVAL 20 MINUTE
+FROM devices d
+JOIN users u ON u.id = d.user_id AND u.email = 'demo@example.com'
+WHERE d.name = 'Feeder-Demo'
+  AND NOT EXISTS (
+    SELECT 1 FROM device_logs dl
+    WHERE dl.device_id = d.id AND dl.message = 'Feeding skipped due to cooldown'
+  );
+
+-- Lid (door) open/close state demo logs
+INSERT INTO device_logs (device_id, level, message, meta, created_at)
+SELECT d.id, 'info', 'LID_OPEN',
+       JSON_OBJECT('servo_angle', 0, 'duration_ms', 8000, 'source', 'init.sql'),
+       NOW() - INTERVAL 18 MINUTE
+FROM devices d
+JOIN users u ON u.id = d.user_id AND u.email = 'demo@example.com'
+WHERE d.name = 'Feeder-Demo'
+  AND NOT EXISTS (
+    SELECT 1 FROM device_logs dl
+    WHERE dl.device_id = d.id AND dl.message = 'LID_OPEN'
+  );
+
+INSERT INTO device_logs (device_id, level, message, meta, created_at)
+SELECT d.id, 'info', 'LID_CLOSED',
+       JSON_OBJECT('servo_angle', 90, 'source', 'init.sql'),
+       NOW() - INTERVAL 17 MINUTE
+FROM devices d
+JOIN users u ON u.id = d.user_id AND u.email = 'demo@example.com'
+WHERE d.name = 'Feeder-Demo'
+  AND NOT EXISTS (
+    SELECT 1 FROM device_logs dl
+    WHERE dl.device_id = d.id AND dl.message = 'LID_CLOSED'
+  );
 
 -- Raspberry Pi Zero W seed (modules & pins) for devices with model = 'raspberry_pi_zero_w'
 -- Servo (PWM via GPIO18)

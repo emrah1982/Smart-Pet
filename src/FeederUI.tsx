@@ -65,6 +65,7 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
   const [logSinceMinutes, setLogSinceMinutes] = useState(1440);
   const logsIntervalRef = useRef<number | null>(null);
   const [logsTick, setLogsTick] = useState(0);
+  const statusRequestInFlight = useRef<boolean>(false);
 
   // Calendar state
   const [schedules, setSchedules] = useState([
@@ -105,6 +106,9 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
       return;
     }
     
+    // Avoid overlapping status requests
+    if (statusRequestInFlight.current) return;
+    statusRequestInFlight.current = true;
     try {
       const url = selectedDeviceId ? `/api/${selectedDeviceId}/status` : '/api/status';
       const response = await fetch(url, { cache: 'no-store' });
@@ -130,6 +134,8 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
       } else {
         setError('Cihaza bağlanılamıyor...');
       }
+    } finally {
+      statusRequestInFlight.current = false;
     }
   };
 
@@ -241,7 +247,8 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
     loadLogs();
     if (logsIntervalRef.current) window.clearInterval(logsIntervalRef.current);
     if (activeTab === 'logs' && selectedDeviceId) {
-      logsIntervalRef.current = window.setInterval(loadLogs, 5000) as any;
+      // Faster polling for logs (2s instead of 5s) for near real-time feeling
+      logsIntervalRef.current = window.setInterval(loadLogs, 2000) as any;
     }
     return () => {
       if (logsIntervalRef.current) {
@@ -251,7 +258,7 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
     };
   }, [activeTab, selectedDeviceId, logLevel, logQuery, logSinceMinutes, logsTick]);
 
-  // Fetch settings and start status polling when device changes
+  // Fetch settings and start status polling when device or tab changes
   useEffect(() => {
     if (!selectedDeviceId) {
       // Clear status when no device selected
@@ -273,16 +280,23 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
     // Fetch immediately; AbortController cancels previous if needed
     fetchSettings();
     setStatusErrorCount(0);
+
+    // Only poll status on dashboard tab to avoid flooding when editing schedules, logs, etc.
+    if (activeTab !== 'dashboard') {
+      return () => {
+        try { settingsAbortRef.current?.abort(); } catch {}
+      };
+    }
+
     fetchStatus();
-    
-    // Start status polling
-    const statusInterval = setInterval(fetchStatus, 2000);
-    
+    // Start status polling (1s instead of 2s for more responsive UI)
+    const statusInterval = setInterval(fetchStatus, 1000);
+
     return () => {
       try { settingsAbortRef.current?.abort(); } catch {}
       clearInterval(statusInterval);
     };
-  }, [selectedDeviceId]);
+  }, [selectedDeviceId, activeTab]);
 
   // Update seedModel when currentModel changes
   useEffect(() => {
@@ -458,7 +472,13 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
         body: JSON.stringify({ name: 'Default', enabled: 1, items })
       });
       if (res.ok) {
-        await loadSchedules();
+        // Optimistic update: use current schedules state, just set created scheduleId
+        try {
+          const data = await res.json().catch(() => null as any);
+          if (data && typeof data.id === 'number') {
+            setScheduleId(data.id);
+          }
+        } catch {}
         alert('Takvim oluşturuldu ve kaydedildi.');
       }
     } else {
@@ -468,7 +488,6 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
         body: JSON.stringify({ items })
       });
       if (res.ok) {
-        await loadSchedules();
         alert('Takvim güncellendi.');
       }
     }
@@ -2979,7 +2998,7 @@ if __name__ == "__main__":
                         <input type="number" value={newDevice.esp_port} onChange={(e) => setNewDevice({ ...newDevice, esp_port: Number(e.target.value) })} className="w-full bg-slate-700 border border-slate-600 rounded px-3 py-2 text-white" />
                       </div>
                     </div>
-                    <div className="flex justify-end mt-4">
+                    <div className="flex flex-wrap justify-end gap-2 mt-4">
                       <button
                         onClick={async () => {
                           // Validate required fields
@@ -3015,7 +3034,49 @@ if __name__ == "__main__":
                         }}
                         disabled={!newDevice.name || !newDevice.serial || !newDevice.esp_host}
                         className={`px-4 py-2 rounded-lg text-white ${(!newDevice.name || !newDevice.serial || !newDevice.esp_host) ? 'bg-slate-600 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
-                      >Ekle</button>
+                      >Ekle (Yeni Kayıt)</button>
+
+                      <button
+                        onClick={async () => {
+                          // Validate required fields (MAC upsert için de aynı zorunluluklar)
+                          if (!newDevice.name || !newDevice.serial || !newDevice.esp_host) {
+                            return alert('Ad, Seri No/MAC ve ESP Host zorunludur');
+                          }
+                          const normalizedSerial = String(newDevice.serial).replace(/:/g, '').toUpperCase();
+                          if (!/^[A-F0-9]{12}$/.test(normalizedSerial)) {
+                            return alert('Seri No/MAC formatı geçersiz. Örn: AA11BB22CC33 veya AA:11:BB:22:CC:33');
+                          }
+                          try {
+                            const res = await fetch('/devices/upsert-by-mac', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                              body: JSON.stringify({
+                                serial: normalizedSerial,
+                                name: newDevice.name,
+                                esp_host: newDevice.esp_host,
+                                esp_port: newDevice.esp_port
+                              })
+                            });
+                            if (res.ok) {
+                              const body = await res.json().catch(() => ({} as any));
+                              const deviceId = body.id;
+                              const list = await (await fetch('/devices', { headers: { 'Authorization': `Bearer ${token}` } })).json();
+                              setDevices(list);
+                              if (deviceId) {
+                                setSelectedDeviceId(String(deviceId));
+                              }
+                              alert(body.created ? 'Cihaz MAC ile oluşturuldu' : 'Cihaz MAC ile güncellendi');
+                            } else {
+                              const err = await res.json().catch(() => ({}));
+                              alert(err.error || 'MAC ile kayıt/güncelleme başarısız');
+                            }
+                          } catch (e) {
+                            alert('MAC ile kayıt/güncelleme sırasında hata oluştu');
+                          }
+                        }}
+                        disabled={!newDevice.name || !newDevice.serial || !newDevice.esp_host}
+                        className={`px-4 py-2 rounded-lg text-white ${(!newDevice.name || !newDevice.serial || !newDevice.esp_host) ? 'bg-slate-600 cursor-not-allowed' : 'bg-emerald-600 hover:bg-emerald-700'}`}
+                      >MAC ile Kaydet/Güncelle</button>
                     </div>
                   </div>
                   <div className="bg-slate-700/30 rounded-lg border border-slate-600 p-4">

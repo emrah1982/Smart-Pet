@@ -4,6 +4,7 @@ import cors from 'cors';
 import compression from 'compression';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import mysql, { ResultSetHeader, RowDataPacket } from 'mysql2/promise';
+import http from 'http';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
@@ -22,6 +23,9 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
   res.setHeader('Keep-Alive', 'timeout=5, max=1000');
   next();
 });
+
+// Feed cooldown (minutes) configurable via env
+const FEED_COOLDOWN_MINUTES = +(process.env.FEED_COOLDOWN_MINUTES || 2);
 app.use(express.json());
 
 const pool = mysql.createPool({
@@ -119,6 +123,62 @@ app.post('/auth/login', async (req: express.Request, res: express.Response) => {
   } catch (err) {
     console.error('[AUTH] login error:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Upsert device by MAC (JWT-protected)
+app.post('/devices/upsert-by-mac', authMiddleware, async (req: express.Request, res: express.Response) => {
+  const userId = (req as any).user.userId;
+  const { serial, name, esp_host, esp_port } = req.body || {};
+  if (!serial || !name || !esp_host || !esp_port) {
+    return res.status(400).json({ error: 'serial, name, esp_host, esp_port required' });
+  }
+  const normalized = String(serial).replace(/:/g, '').toUpperCase();
+  if (!/^[A-F0-9]{12}$/.test(normalized)) {
+    return res.status(400).json({ error: 'invalid serial format (expected 12 hex chars, e.g. AA11BB22CC33)' });
+  }
+  try {
+    const [exists] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM devices WHERE REPLACE(UPPER(serial), ":", "") = ? LIMIT 1', [normalized]
+    );
+    if ((exists as any[]).length > 0) {
+      const id = (exists as any[])[0].id;
+      await pool.query(
+        'UPDATE devices SET name = ?, esp_host = ?, esp_port = ?, user_id = ? WHERE id = ?',
+        [name, esp_host, +esp_port, userId, id]
+      );
+      return res.json({ id, updated: true });
+    }
+    const [result] = await pool.query<ResultSetHeader>(
+      'INSERT INTO devices (user_id, name, serial, esp_host, esp_port) VALUES (?, ?, ?, ?, ?)',
+      [userId, name, normalized, esp_host, +esp_port]
+    );
+    return res.status(201).json({ id: (result as ResultSetHeader).insertId, created: true });
+  } catch (err) {
+    console.error('[UPSERT-BY-MAC] error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Unauthenticated log ingestion by MAC (for Arduino devices)
+app.post('/logs/ingest', async (req: express.Request, res: express.Response) => {
+  try {
+    const macRaw = (req.query.mac as string) || (req.headers['x-device-mac'] as string) || '';
+    const level = (req.body?.level as string) || 'info';
+    const message = (req.body?.message as string) || '';
+    const meta = req.body?.meta ?? null;
+    if (!macRaw) return res.status(400).json({ error: 'mac required' });
+    if (!message) return res.status(400).json({ error: 'message required' });
+    const mac = String(macRaw).replace(/:/g, '').toUpperCase();
+    const [dRows] = await pool.query<RowDataPacket[]>('SELECT id FROM devices WHERE REPLACE(UPPER(serial), ":", "") = ? LIMIT 1', [mac]);
+    if ((dRows as any[]).length === 0) return res.status(404).json({ error: 'device not found' });
+    const deviceId = (dRows as any[])[0].id;
+    const metaStr = meta == null ? null : (typeof meta === 'string' ? meta : JSON.stringify(meta));
+    await pool.query('INSERT INTO device_logs (device_id, level, message, meta) VALUES (?, ?, ?, CAST(? AS JSON))', [deviceId, String(level).toLowerCase(), message, metaStr]);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[LOGS_INGEST] error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -237,6 +297,101 @@ app.post('/config/settings', async (req: express.Request, res: express.Response)
   if (!esp_host || !esp_port) return res.status(400).json({ error: 'esp_host and esp_port required' });
   await pool.query('INSERT INTO settings (esp_host, esp_port) VALUES (?, ?)', [esp_host, esp_port]);
   res.json({ ok: true });
+});
+
+// Push schedules to device (sync from DB -> Wemos)
+app.post('/devices/:deviceId/schedules/sync', authMiddleware, async (req: express.Request, res: express.Response) => {
+  const userId = (req as any).user.userId;
+  const { deviceId } = req.params as any;
+  try {
+    // Ensure device belongs to current user and has network info
+    const [dRows] = await pool.query<RowDataPacket[]>(
+      'SELECT id, esp_host, esp_port FROM devices WHERE id = ? AND user_id = ? LIMIT 1',
+      [deviceId, userId]
+    );
+    if ((dRows as any[]).length === 0) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+    const device = (dRows as any[])[0] as any;
+    const espHost: string = device.esp_host;
+    const espPort: number = device.esp_port || 80;
+
+    // Load schedules + items for this device (reuse logic similar to GET /devices/:deviceId/schedules)
+    const [sRows] = await pool.query<RowDataPacket[]>(
+      'SELECT id, name, enabled FROM schedules WHERE device_id = ?',
+      [deviceId]
+    );
+    const schedules = sRows as any[];
+    let slots: Array<{ time: string; duration_ms: number|null; amount: number; enabled: boolean }> = [];
+
+    if (schedules.length > 0) {
+      const scheduleIds = schedules.map(s => s.id);
+      const [allItems] = await pool.query<RowDataPacket[]>(
+        'SELECT id, schedule_id, time, amount, duration_ms, enabled FROM schedule_items WHERE schedule_id IN (?)',
+        [scheduleIds]
+      );
+      for (const it of (allItems as any[])) {
+        const parent = schedules.find(s => s.id === it.schedule_id);
+        if (!parent || !parent.enabled) continue;
+        slots.push({
+          time: it.time,
+          duration_ms: it.duration_ms ?? null,
+          amount: it.amount,
+          enabled: !!it.enabled
+        });
+      }
+    }
+
+    // Sort slots by time for deterministic order
+    slots.sort((a, b) => a.time.localeCompare(b.time));
+
+    const payload = JSON.stringify(slots);
+
+    const options: http.RequestOptions = {
+      host: espHost,
+      port: espPort,
+      path: '/schedule',
+      method: 'POST',
+      timeout: 4000,
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    };
+
+    const sendToDevice = () => new Promise<{ statusCode?: number; body: string }>((resolve, reject) => {
+      const reqDev = http.request(options, (resp) => {
+        let body = '';
+        resp.setEncoding('utf8');
+        resp.on('data', (chunk) => { body += chunk; });
+        resp.on('end', () => {
+          resolve({ statusCode: resp.statusCode, body });
+        });
+      });
+      reqDev.on('error', (err) => reject(err));
+      reqDev.on('timeout', () => {
+        reqDev.destroy(new Error('Device request timeout'));
+      });
+      reqDev.write(payload);
+      reqDev.end();
+    });
+
+    const resp = await sendToDevice().catch((err: any) => {
+      console.error('[SCHEDULE_SYNC] device request error:', err);
+      return { statusCode: undefined, body: String(err?.message || 'device error') };
+    });
+
+    return res.json({
+      ok: true,
+      device: { id: device.id, esp_host: espHost, esp_port: espPort },
+      slotsCount: slots.length,
+      deviceStatusCode: resp.statusCode ?? null,
+      deviceResponse: resp.body
+    });
+  } catch (err) {
+    console.error('[SCHEDULE_SYNC] error:', err);
+    return res.status(500).json({ error: 'Failed to sync schedule to device' });
+  }
 });
 
 // Devices list by user (protected)
@@ -684,6 +839,152 @@ app.get('/devices/:deviceId/security', async (req: express.Request, res: express
   const { deviceId } = req.params;
   const [rows] = await pool.query('SELECT api_token, allow_remote FROM security_settings WHERE device_id = ?', [deviceId]);
   res.json((rows as any[])[0] || null);
+});
+
+// Check feeding schedule by MAC address (for Arduino/ESP devices)
+app.get('/feed/check', async (req: express.Request, res: express.Response) => {
+  try {
+    const macRaw = (req.query.mac as string) || (req.headers['x-device-mac'] as string) || '';
+    if (!macRaw) {
+      return res.status(400).json({ error: 'MAC address required', shouldFeed: false });
+    }
+    
+    const mac = String(macRaw).replace(/:/g, '').toUpperCase();
+    console.log('[FEED_CHECK] MAC:', mac);
+    
+    // Find device by MAC (serial)
+    const [dRows] = await pool.query<RowDataPacket[]>(
+      'SELECT id, name FROM devices WHERE REPLACE(UPPER(serial), ":", "") = ? AND active = 1 LIMIT 1',
+      [mac]
+    );
+    
+    if ((dRows as any[]).length === 0) {
+      console.log('[FEED_CHECK] Device not found for MAC:', mac);
+      return res.json({ error: 'Device not found', shouldFeed: false, mac });
+    }
+    
+    const device = (dRows as any[])[0];
+    const deviceId = device.id;
+    console.log('[FEED_CHECK] Device found:', device.name, 'ID:', deviceId);
+    
+    // Get current time with optional timezone offset (minutes)
+    const tzOffsetMin = Number((req.query.tzOffsetMin as string) || 0) || 0; // e.g. +180 for UTC+3
+    const nowUtc = new Date();
+    const localMs = nowUtc.getTime() + tzOffsetMin * 60_000;
+    const local = new Date(localMs);
+    const hh = String(local.getHours()).padStart(2, '0');
+    const mm = String(local.getMinutes()).padStart(2, '0');
+    const currentTime = `${hh}:${mm}`;
+    // also produce ±1 minute neighbors
+    const prevMin = new Date(localMs - 60_000);
+    const nextMin = new Date(localMs + 60_000);
+    const timesToMatch = [
+      currentTime,
+      `${String(prevMin.getHours()).padStart(2, '0')}:${String(prevMin.getMinutes()).padStart(2, '0')}`,
+      `${String(nextMin.getHours()).padStart(2, '0')}:${String(nextMin.getMinutes()).padStart(2, '0')}`
+    ];
+    console.log('[FEED_CHECK] Times to match:', timesToMatch.join(', '));
+    
+    // Find active schedules with matching time (±1 minute tolerance)
+    const [sRows] = await pool.query<RowDataPacket[]>(
+      `SELECT si.id, si.time, si.amount, si.duration_ms, s.name as schedule_name
+       FROM schedule_items si
+       JOIN schedules s ON s.id = si.schedule_id
+       WHERE s.device_id = ? AND s.enabled = 1 AND si.enabled = 1 AND si.time IN (?, ?, ?)
+       ORDER BY FIELD(si.time, ?, ?, ?) LIMIT 1`,
+      [deviceId, timesToMatch[0], timesToMatch[1], timesToMatch[2], timesToMatch[0], timesToMatch[1], timesToMatch[2]]
+    );
+    
+    if ((sRows as any[]).length === 0) {
+      console.log('[FEED_CHECK] No matching schedule for time:', currentTime);
+      return res.json({ 
+        shouldFeed: false, 
+        mac, 
+        deviceId, 
+        deviceName: device.name,
+        currentTime,
+        reason: 'no_schedule',
+        message: 'No feeding scheduled for this time'
+      });
+    }
+    
+    const schedule = (sRows as any[])[0];
+    console.log('[FEED_CHECK] Schedule found:', schedule.schedule_name, 'Amount:', schedule.amount);
+
+    // Cooldown: prevent multiple feeds in same time window per device
+    const cooldownMinutes = FEED_COOLDOWN_MINUTES;
+    const [coolRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, created_at
+       FROM device_logs
+       WHERE device_id = ?
+         AND level = 'info'
+         AND message LIKE '%FEED_EXECUTED%'
+         AND created_at >= (NOW() - INTERVAL ? MINUTE)
+       ORDER BY id DESC
+       LIMIT 1`,
+      [deviceId, cooldownMinutes]
+    );
+
+    if ((coolRows as any[]).length > 0) {
+      const last = (coolRows as any[])[0];
+      console.log('[FEED_CHECK] Cooldown active, last feed at:', last.created_at);
+      return res.json({
+        shouldFeed: false,
+        mac,
+        deviceId,
+        deviceName: device.name,
+        currentTime,
+        reason: 'cooldown',
+        message: 'Feed skipped due to cooldown'
+      });
+    }
+
+    // No cooldown hit -> allow feeding and record FEED_EXECUTED log
+    // Also fetch device_settings.max_open_ms as default duration
+    let maxOpenMs = 5000;
+    try {
+      const [setRows] = await pool.query<RowDataPacket[]>(
+        'SELECT max_open_ms FROM device_settings WHERE device_id = ? LIMIT 1',
+        [deviceId]
+      );
+      if ((setRows as any[]).length > 0) {
+        const row = (setRows as any[])[0];
+        if (row.max_open_ms && row.max_open_ms > 0 && row.max_open_ms < 60000) {
+          maxOpenMs = row.max_open_ms;
+        }
+      }
+    } catch (e) {
+      console.error('[FEED_CHECK] Failed to read device_settings.max_open_ms:', e);
+    }
+
+    const durationMs = (schedule as any).duration_ms || maxOpenMs || 5000;
+    try {
+      await pool.query(
+        'INSERT INTO device_logs (device_id, level, message, meta) VALUES (?, \'info\', \'FEED_EXECUTED\', CAST(? AS JSON))',
+        [deviceId, JSON.stringify({ mac, schedule_id: schedule.id, time: currentTime, duration_ms: durationMs })]
+      );
+    } catch (e) {
+      console.error('[FEED_CHECK] Failed to insert FEED_EXECUTED log:', e);
+    }
+
+    // Return feeding instruction
+    return res.json({
+      shouldFeed: true,
+      mac,
+      deviceId,
+      deviceName: device.name,
+      currentTime,
+      scheduleId: schedule.id,
+      scheduleName: schedule.schedule_name,
+      amount: schedule.amount,
+      durationMs: durationMs,
+      message: 'Feeding time!'
+    });
+    
+  } catch (err) {
+    console.error('[FEED_CHECK] Error:', err);
+    return res.status(500).json({ error: 'Internal server error', shouldFeed: false });
+  }
 });
 
 // Reverse proxy by device

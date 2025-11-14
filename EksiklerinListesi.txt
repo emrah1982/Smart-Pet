@@ -1,0 +1,23 @@
+Eksiklerin Listesi
+[feed tekrarı engelleme] Aynı dakika içinde birden fazla tetiklemeyi önlemek için sunucuda idempotency/cooldown.
+[timezone yapılandırması] tzOffsetMin ve dakika toleransı (±1) konfigürasyona (ENV veya DB settings) taşınmalı.
+[logs güvenliği] POST /logs/ingest için güvenlik (API token, IP allowlist, rate-limit).
+[Arduino süre uygulaması] durationMs değeri şu an sadece loglanıyor; kapak açık kalma süresine fiilen uygulanmıyor.
+[Arduino log kapsamı] postLog() çağrıları kritik noktalara eklenmeli:
+Başarılı/başarısız feed kontrolü
+openLid() ve closeLid() başlangıç/bitiş olayları
+WiFi bağlandı/bağlantı koptu
+[Backend host ayarı] Arduino BACKEND_HOST değerinin portal/provisioning ekranından ayarlanabilir olması.
+[UI upsert akışı] “Cihaz Yönetimi” sayfasında MAC ile kayıt/güncelle (JWT: POST /devices/upsert-by-mac) için form ve akış.
+[Dokümantasyon] Yeni endpoint’ler, port 8082, timezone parametresi ve güvenlik notları için README/kurulum dökümanı güncellemesi.
+[Firewall/erişim] Windows Firewall/router’da 8082 için LAN erişimi doğrulama.
+[Üretim JSON parse] ArduinoJson bağımlılığı ve bellek (StaticJsonDocument boyutu) için net talimatlar; düşük hafıza cihazlarda plan.
+[Hata yönetimi] Arduino tarafında HTTP retry/backoff ve server tarafında hata durumlarının tutarlı yanıt formatı.
+[İndeksleme] Sorgu performansı için schedule_items(time) ve schedules(device_id, enabled) alanlarında uygun index kontrolleri (şu an device_id/schedule_id index var; time için ek index değerlendirilebilir).
+[Auth opsiyonu] GET /feed/check production’da opsiyonel auth veya imzalı istek koruması (spoofing riskine karşı).
+[Tolerans param.] ±1 dakika toleransının configurable olması (örn. 0–5 dk arası).
+[UI log meta] Log satırlarında meta JSON’unun daha okunaklı gösterimi (expand/collapse).
+Kısa Durum Özeti
+MAC eşleşmesi, toleranslı takvim kontrolü ve log ingest çalışır durumda.
+UI “Loglar” sekmesi MySQL’e yazılan kayıtları gösterir.
+Gerekli iyileştirmeler için yukarıdaki maddeler planlanmalıdır.
