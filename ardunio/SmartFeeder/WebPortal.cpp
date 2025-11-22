@@ -46,6 +46,34 @@ bool WebPortal::begin() {
   server->on("/api/wifi-scan/", HTTP_GET, [this]() { this->handleWiFiScan(); });
   server->on("/api/wifi-connect/", HTTP_POST, [this]() { this->handleWiFiConnect(); });
   server->on("/api/wifi-status/", HTTP_GET, [this]() { this->handleWiFiStatus(); });
+  server->on("/api/wifi-reset/", HTTP_POST, [this]() { this->handleWiFiReset(); });
+  server->on("/api/wifi-disconnect/", HTTP_POST, [this]() { this->handleWiFiDisconnect(); });
+  server->on("/api/reset-mode/", HTTP_POST, [this]() { this->handleResetMode(); });
+  server->on("/api/sync-schedule/", HTTP_POST, [this]() { this->handleSyncSchedule(); });
+  // Control UI (offline-like page) accessible in any mode
+  server->on("/control", HTTP_GET, [this]() {
+    server->setContentLength(strlen_P(SCHEDULER_PAGE));
+    server->send_P(200, "text/html", SCHEDULER_PAGE);
+  });
+  // WiFi setup page accessible directly
+  server->on("/wifi-setup", HTTP_GET, [this]() {
+    server->setContentLength(strlen_P(WIFI_SETUP_PAGE));
+    server->send_P(200, "text/html", WIFI_SETUP_PAGE);
+  });
+  // Debug status page
+  server->on("/debug", HTTP_GET, [this]() {
+    String html = "<!DOCTYPE html><html><head><meta charset='utf-8'/><title>Debug</title></head><body>";
+    html += "<h2>Debug Bilgileri</h2>";
+    html += "<p><b>Mod:</b> " + String(modeManager->isModeSelected() ? (modeManager->getMode() == MODE_ONLINE ? "ONLINE" : "OFFLINE") : "SEÇİLMEDİ") + "</p>";
+    html += "<p><b>WiFi Status:</b> " + String(WiFi.status()) + " (3=WL_CONNECTED)</p>";
+    html += "<p><b>WiFi SSID:</b> " + WiFi.SSID() + "</p>";
+    html += "<p><b>WiFi IP:</b> " + WiFi.localIP().toString() + "</p>";
+    html += "<p><b>AP IP:</b> " + WiFi.softAPIP().toString() + "</p>";
+    html += "<p><b>Manager Connected:</b> " + String(wifiManager && wifiManager->connected() ? "YES" : "NO") + "</p>";
+    html += "<p><a href='/'>Ana Sayfa</a> | <a href='/control'>Kontrol</a></p>";
+    html += "</body></html>";
+    server->send(200, "text/html", html);
+  });
   server->onNotFound([this]() { this->handleNotFound(); });
   
   server->begin();
@@ -60,7 +88,17 @@ void WebPortal::handleClient() {
 }
 
 bool WebPortal::startAccessPoint() {
-  WiFi.mode(WIFI_AP);
+  // Disable WiFi sleep for stable AP operation (like reference code)
+#if defined(ESP32)
+  WiFi.setSleep(false);
+#else
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
+  
+  // Use AP_STA mode to allow scanning while AP is active
+  WiFi.mode(WIFI_AP_STA);
+  delay(100);
+  
   WiFi.softAPConfig(AP_IP_ADDR, AP_GATEWAY, AP_SUBNET);
   
   bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONNECTIONS);
@@ -81,16 +119,48 @@ bool WebPortal::startAccessPoint() {
 }
 
 void WebPortal::handleRoot() {
+  LOG("WebPortal: handleRoot called - Mode=%d, WiFiStatus=%d", 
+      modeManager->getMode(), WiFi.status());
+      
   if (!modeManager->isModeSelected()) {
     // Show mode selection page
+    LOG("WebPortal: Showing mode selection page");
     server->setContentLength(strlen_P(MODE_SELECTION_PAGE));
     server->send_P(200, "text/html", MODE_SELECTION_PAGE);
-  } else if (modeManager->getMode() == MODE_ONLINE && wifiManager && !wifiManager->connected()) {
-    // Online mode but not connected to WiFi - show WiFi setup
-    server->setContentLength(strlen_P(WIFI_SETUP_PAGE));
-    server->send_P(200, "text/html", WIFI_SETUP_PAGE);
+    return;
+  }
+  
+  if (modeManager->getMode() == MODE_ONLINE) {
+    // Check both manager state and actual WiFi status
+    bool managerConnected = wifiManager && wifiManager->connected();
+    bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+    
+    LOG("WebPortal: Online mode - Manager=%d, WiFi=%d", managerConnected, wifiConnected);
+    
+    // If credentials are missing, force WiFi setup even if WiFi reports connected (stale state)
+    bool hasCredentials = wifiManager && wifiManager->hasCredentials();
+    if (!hasCredentials) {
+      LOG("WebPortal: No saved credentials, forcing WiFi setup");
+      server->setContentLength(strlen_P(WIFI_SETUP_PAGE));
+      server->send_P(200, "text/html", WIFI_SETUP_PAGE);
+      return;
+    }
+    
+    if (!wifiConnected) {
+      // Online mode but not connected to WiFi - show WiFi setup
+      LOG("WebPortal: Showing WiFi setup (not connected)");
+      server->setContentLength(strlen_P(WIFI_SETUP_PAGE));
+      server->send_P(200, "text/html", WIFI_SETUP_PAGE);
+    } else {
+      // Online mode and WiFi connected - show online status
+      LOG("WebPortal: Showing online status (connected to %s, IP=%s)", 
+          WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+      server->setContentLength(strlen_P(ONLINE_STATUS_PAGE));
+      server->send_P(200, "text/html", ONLINE_STATUS_PAGE);
+    }
   } else {
-    // Show scheduler page
+    // Offline mode - show scheduler page
+    LOG("WebPortal: Showing scheduler page (offline mode)");
     server->setContentLength(strlen_P(SCHEDULER_PAGE));
     server->send_P(200, "text/html", SCHEDULER_PAGE);
   }
@@ -200,6 +270,18 @@ void WebPortal::handleGetStatus() {
     json += "\"time\":\"" + timeManager->getTimeString() + "\"";
   } else {
     json += "\"time\":null";
+  }
+  
+  // Add MAC address
+  json += ",\"mac\":\"" + WiFi.macAddress() + "\"";
+  
+  // Add WiFi info if in online mode
+  if (modeManager->getMode() == MODE_ONLINE) {
+    json += ",\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
+    if (WiFi.status() == WL_CONNECTED) {
+      json += ",\"wifi_ip\":\"" + WiFi.localIP().toString() + "\"";
+      json += ",\"wifi_ssid\":\"" + WiFi.SSID() + "\"";
+    }
   }
   
   json += "}";
@@ -319,20 +401,52 @@ uint8_t WebPortal::parseExcludedDays(const String& excludeStr) {
 }
 
 void WebPortal::handleChangeMode() {
-  LOG("WebPortal: Mode change requested via web");
-  
-  server->send(200, "text/plain", "OK");
-  
-  // Give time for response to be sent
-  delay(100);
-  
-  // Only reset mode selection, keep schedule and time
-  modeManager->reset();
-  
-  LOG("WebPortal: Mode reset, schedule and time preserved, rebooting...");
-  delay(500);
-  
-  ESP.restart();
+  // Check if specific mode is requested
+  if (server->hasArg("mode")) {
+    String mode = server->arg("mode");
+    mode.trim();
+    
+    OperationMode targetMode;
+    if (mode == "offline") {
+      targetMode = MODE_OFFLINE;
+    } else if (mode == "online") {
+      targetMode = MODE_ONLINE;
+    } else {
+      server->send(400, "text/plain", "Invalid mode");
+      return;
+    }
+    
+    LOG("WebPortal: Changing to %s mode", mode.c_str());
+    
+    if (modeManager->setMode(targetMode)) {
+      server->send(200, "text/plain", "OK");
+      
+      // Give time for response to be sent
+      delay(100);
+      
+      LOG("WebPortal: Mode changed, rebooting...");
+      delay(500);
+      ESP.restart();
+    } else {
+      server->send(500, "text/plain", "Failed to set mode");
+    }
+  } else {
+    // No mode specified - reset to mode selection
+    LOG("WebPortal: Mode reset requested via web");
+    
+    server->send(200, "text/plain", "OK");
+    
+    // Give time for response to be sent
+    delay(100);
+    
+    // Only reset mode selection, keep schedule and time
+    modeManager->reset();
+    
+    LOG("WebPortal: Mode reset, schedule and time preserved, rebooting...");
+    delay(500);
+    
+    ESP.restart();
+  }
 }
 
 void WebPortal::handleFactoryReset() {
@@ -355,13 +469,26 @@ void WebPortal::handleFactoryReset() {
 }
 
 void WebPortal::handleWiFiScan() {
+  LOG("WebPortal: WiFi scan requested");
+  
   if (!wifiManager) {
-    server->send(500, "application/json", "[]");
+    LOG("WebPortal: WiFi manager not available");
+    server->send(200, "application/json", "{\"success\":false,\"error\":\"WiFi yöneticisi hazır değil\"}");
     return;
   }
   
-  String json = wifiManager->scanNetworks();
-  server->send(200, "application/json", json);
+  String networksJson;
+  String errorMessage;
+  bool ok = wifiManager->scanNetworks(networksJson, errorMessage);
+  if (ok) {
+    LOG("WebPortal: Scan complete, returning %d bytes", networksJson.length());
+    String payload = "{\"success\":true,\"networks\":" + networksJson + "}";
+    server->send(200, "application/json", payload);
+  } else {
+    LOG("WebPortal: Scan failed: %s", errorMessage.c_str());
+    String payload = "{\"success\":false,\"error\":\"" + errorMessage + "\"}";
+    server->send(200, "application/json", payload);
+  }
 }
 
 void WebPortal::handleWiFiConnect() {
@@ -378,12 +505,40 @@ void WebPortal::handleWiFiConnect() {
   String ssid = server->arg("ssid");
   String pass = server->arg("pass");
   
-  LOG("WebPortal: WiFi connect request - SSID=%s", ssid.c_str());
+  LOG("WebPortal: WiFi connect request - SSID=%s, Pass length=%d", ssid.c_str(), pass.length());
+  
+  // Validate inputs
+  if (ssid.length() == 0) {
+    LOG("WebPortal: Empty SSID provided");
+    server->send(400, "text/plain", "SSID boş olamaz");
+    return;
+  }
   
   if (wifiManager->connect(ssid, pass, 20000)) {
+    LOG("WebPortal: Connection successful");
     server->send(200, "text/plain", "OK");
   } else {
-    server->send(500, "text/plain", "Connection failed");
+    LOG("WebPortal: Connection failed");
+    // Get WiFi status to provide better error message
+    int status = WiFi.status();
+    String errorMsg = "Bağlantı başarısız";
+    
+    switch(status) {
+      case WL_NO_SSID_AVAIL:
+        errorMsg = "Ağ bulunamadı - SSID yanlış veya sinyal zayıf";
+        break;
+      case WL_CONNECT_FAILED:
+        errorMsg = "Şifre yanlış veya kimlik doğrulama hatası";
+        break;
+      case WL_DISCONNECTED:
+        errorMsg = "Bağlantı zaman aşımı - Sinyal çok zayıf";
+        break;
+      default:
+        errorMsg = "Bağlantı hatası (kod: " + String(status) + ")";
+        break;
+    }
+    
+    server->send(500, "text/plain", errorMsg);
   }
 }
 
@@ -404,4 +559,60 @@ void WebPortal::handleWiFiStatus() {
   
   json += "}";
   server->send(200, "application/json", json);
+}
+
+void WebPortal::handleWiFiDisconnect() {
+  if (!wifiManager) {
+    server->send(500, "text/plain", "WiFi manager not available");
+    return;
+  }
+  
+  LOG("WebPortal: WiFi disconnect requested");
+  wifiManager->disconnect();
+  server->send(200, "text/plain", "OK");
+}
+
+void WebPortal::handleWiFiReset() {
+  if (!wifiManager) {
+    server->send(500, "text/plain", "WiFi manager not available");
+    return;
+  }
+  
+  LOG("WebPortal: WiFi reset requested - clearing credentials and returning to setup");
+  wifiManager->disconnect();
+  wifiManager->clearCredentials();
+  server->send(200, "text/plain", "OK");
+}
+
+void WebPortal::handleResetMode() {
+  LOG("WebPortal: Mode reset requested - returning to mode selection");
+  
+  // Clear mode selection but keep other settings
+  if (modeManager) {
+    modeManager->reset();
+  }
+  
+  // Clear WiFi credentials
+  if (wifiManager) {
+    wifiManager->disconnect();
+    wifiManager->clearCredentials();
+  }
+  
+  server->send(200, "text/plain", "OK");
+  
+  LOG("WebPortal: Mode reset complete, rebooting...");
+  delay(500);
+  ESP.restart();
+}
+
+void WebPortal::handleSyncSchedule() {
+  LOG("WebPortal: Schedule sync requested");
+  
+  // This requires BackendClient to be available
+  // We'll need to pass it to WebPortal or access it globally
+  // For now, return a simple response
+  server->send(200, "text/plain", "Sync triggered - check serial monitor");
+  
+  // Note: Actual sync will be handled by BackendClient in main loop
+  // This endpoint just triggers the sync request
 }

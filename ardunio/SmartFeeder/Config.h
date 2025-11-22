@@ -61,6 +61,9 @@
 #define BACKEND_HOST        "192.168.1.100"
 #define BACKEND_PORT        8082
 #define BACKEND_ENABLED     true
+#define BACKEND_USE_HTTPS   false
+#define BACKEND_AUTH_TOKEN  "your_device_token_here"  // Change this to your actual token
+#define REACT_APP_URL       "http://192.168.1.100:5173"  // React frontend URL (Vite dev server)
 
 // ================== Storage Configuration ==================
 #define NVS_NAMESPACE       "feeder"

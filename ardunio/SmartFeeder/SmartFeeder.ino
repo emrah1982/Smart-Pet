@@ -263,11 +263,18 @@ bool initializeModules() {
       wifiManager.connectSaved();
     }
     
-    // Initialize backend client
+    // Initialize backend client with token and HTTPS support
 #if BACKEND_ENABLED
-    backendClient.begin(BACKEND_HOST, BACKEND_PORT);
+    backendClient.begin(BACKEND_HOST, BACKEND_PORT, BACKEND_AUTH_TOKEN, BACKEND_USE_HTTPS);
     backendClient.setTimezoneOffset(timeManager.getTimezoneOffset());
     LOG("Backend client initialized - MAC: %s", backendClient.getMacAddress().c_str());
+    
+    // Sync schedule from backend on startup
+    if (backendClient.syncScheduleFromBackend()) {
+      LOG("Initial schedule sync successful");
+    } else {
+      LOG("Initial schedule sync failed - will retry later");
+    }
 #endif
   }
   

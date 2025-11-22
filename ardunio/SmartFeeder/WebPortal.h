@@ -56,6 +56,10 @@ private:
   void handleWiFiScan();
   void handleWiFiConnect();
   void handleWiFiStatus();
+  void handleWiFiReset();
+  void handleWiFiDisconnect();
+  void handleResetMode();
+  void handleSyncSchedule();
   void handleNotFound();
   
   // Helper functions

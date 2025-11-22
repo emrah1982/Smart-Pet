@@ -30,9 +30,11 @@ public:
   
   /**
    * @brief Scan for available WiFi networks
-   * @return JSON string with network list
+   * @param[out] jsonResult JSON array string with network list
+   * @param[out] errorMessage Human readable error when scan fails
+   * @return true if scan produced at least one network
    */
-  String scanNetworks();
+  bool scanNetworks(String& jsonResult, String& errorMessage);
   
   /**
    * @brief Connect to WiFi network
@@ -53,6 +55,7 @@ public:
    * @brief Disconnect from WiFi
    */
   void disconnect();
+  bool hasCredentials() const;
   
   /**
    * @brief Check if connected to WiFi
