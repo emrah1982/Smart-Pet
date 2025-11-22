@@ -1,0 +1,850 @@
+/*
+  ============================================================================
+  SMART PET FEEDER - YEMEK İZLEME SİSTEMİ
+  ============================================================================
+  
+  GENEL BAKIŞ:
+  -----------
+  Bu kod, ESP8266/ESP32 tabanlı akıllı evcil hayvan besleyici için geliştirilmiş
+  tam otomatik WiFi provisioning ve servo motor kontrol sistemidir.
+  
+  TEMEL ÖZELLİKLER:
+  ----------------
+  1. WiFi Yönetimi:
+     - Cihaz açılır açılmaz otomatik AP (Access Point) modu aktif
+     - Captive Portal ile kullanıcı dostu WiFi kurulumu
+     - RSSI sinyaline göre sıralanmış ağ listesi
+     - Girilen bilgiler kalıcı olarak kaydedilir
+     - Bağlantı koptuğunda otomatik yeniden bağlanma
+     
+  2. Servo Motor & Kapak Kontrolü:
+     - 4 durum izleme: KAPALI(0), ACILIYOR(1), ACIK(2), KAPANIYOR(3)
+     - Yumuşak ve kontrollü hareket (2° step'ler ile)
+     - Programlanabilir açık kalma süresi (varsayılan 5 saniye)
+     - Otomatik kapanma özelliği
+     
+  3. Gerçek Zamanlı İzleme:
+     - Serial Plotter uyumlu veri çıktısı
+     - Servo açısı, WiFi sinyali, internet bağlantısı ve kapak durumu
+     - Detaylı debug logları
+     
+  4. Güvenlik:
+     - WiFi'ye bağlandıktan sonra AP otomatik kapanır
+     - Güvenli HTTPS bağlantısı kontrolü
+     - MAC adresi tabanlı seri numarası üretimi
+  
+  KONFIGÜRASYON:
+  --------------
+  AP Ayarları:
+    - SSID: Secgem-Smart-Pet-Freeder-Provision
+    - Şifre: 12345678
+    - IP: 192.168.4.1
+    - Portal URL: http://wifi/ veya http://192.168.4.1/
+  
+  Servo Ayarları:
+    - ESP32: GPIO 18 (değiştirilebilir: 5/19/21/22/23)
+    - ESP8266: GPIO 14 (D5)
+    - Kapalı açı: 0°
+    - Açık açı: 180°
+    - Hareket hızı: 2°/adım (değiştirilebilir)
+    - Açık kalma süresi: 5000ms (değiştirilebilir)
+  
+  KULLANIM SENARYOSU:
+  -------------------
+  1. Cihazı prize takın
+  2. Telefonunuzdan "Secgem-Smart-Pet-Freeder-Provision" ağına bağlanın (şifre: 12345678)
+  3. Tarayıcı otomatik açılır, açılmazsa http://wifi/ yazın
+  4. Ev WiFi ağınızı seçin ve şifresini girin
+  5. Kaydet'e basın, cihaz otomatik bağlanacak
+  6. Servo motor hazır duruma gelecek ve kapak kapalı pozisyonda olacak
+  7. Demo modda her 20 saniyede kapak otomatik açılıp kapanacak
+  
+  SERIAL MONİTÖR ÇIKTISI:
+  -----------------------
+  Bağlantı durumu, servo açısı, WiFi sinyali ve kapak durumu anlık gösterilir.
+  Örnek: "ServoAngle:90 RSSI:-62 InternetOK:1 LidState:2"
+  
+  KAPAK DURUMLARI:
+  ---------------
+  0 = KAPALI     : Servo 0° pozisyonunda, kapak tamamen kapalı
+  1 = ACILIYOR   : Servo 0°'den 180°'ye hareket ediyor
+  2 = ACIK       : Servo 180° pozisyonunda, kapak açık (5 saniye bekler)
+  3 = KAPANIYOR  : Servo 180°'den 0°'a geri dönüyor
+  
+  GELİŞTİRİCİ NOTLARI:
+  -------------------
+  - openLid() ve closeLid() fonksiyonlarını HTTP endpoint'lere bağlayabilirsiniz
+  - Demo modu loop() içinde devre dışı bırakılabilir
+  - Servo hareket hızını LID_MOVE_SPEED değeri ile ayarlayabilirsiniz
+  - Açık kalma süresini LID_OPEN_DURATION_MS ile değiştirebilirsiniz
+  - ESP8266 ve ESP32 otomatik algılanır, farklı kütüphaneler kullanılır
+  
+  DESTEKLENEN PLATFORMLAR:
+  ------------------------
+  - ESP8266 (NodeMCU, Wemos D1 Mini, vb.)
+  - ESP32 (DevKit, WROOM, vb.)
+  
+  ============================================================================
+*/
+
+ #if defined(ESP8266)
+  #include <ESP8266WiFi.h>
+  #include <ESP8266HTTPClient.h>
+  #include <ESP8266WebServer.h>
+  #include <DNSServer.h>
+  #include <EEPROM.h>
+  #include <Servo.h>
+ #elif defined(ESP32)
+  #include <WiFi.h>
+  #include <HTTPClient.h>
+  #include <WebServer.h>
+  #include <DNSServer.h>
+  #include <Preferences.h>
+  #include <ESP32Servo.h>
+ #else
+  #error "Only ESP8266 or ESP32 is supported."
+ #endif
+
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+
+// ---------- Sabitler ----------
+#define BAUDRATE               115200
+#define PLOT_INTERVAL_MS        500
+#define NET_CHECK_INTERVAL_MS  5000
+#define FEED_CHECK_INTERVAL_MS 60000   // Her dakika yem takvimi kontrolü
+#define SERVO_STEP_INTERVAL_MS 50      // Daha yumuşak hareket için kısaltıldı
+#define SERVO_MIN_US             500
+#define SERVO_MAX_US            2400
+
+// ---------- Kapak Ayarları ----------
+#define LID_CLOSED_ANGLE        0      // Kapak kapalı pozisyonu
+#define LID_OPEN_ANGLE          180    // Kapak açık pozisyonu
+#define LID_OPEN_DURATION_MS    5000   // Kapak açık kalma süresi (5 saniye)
+#define LID_MOVE_SPEED          2      // Her adımda kaç derece hareket (daha yavaş = daha yumuşak)
+
+const char* AP_SSID = "Secgem-Smart-Pet-Freeder-Provision";
+const char* AP_PASS = "12345678";
+IPAddress apIP(192,168,4,1);
+IPAddress netMsk(255,255,255,0);
+const byte DNS_PORT = 53;
+
+const char* CAPTIVE_URL = "http://wifi/";
+const char* BACKEND_HOST = "192.168.1.100";
+const int   BACKEND_PORT = 8082;
+const int   TZ_OFFSET_MIN = 180; // UTC+3
+
+#if defined(ESP8266)
+  ESP8266WebServer portalServer(80);
+  DNSServer dnsServer;
+  const int EEPROM_SIZE = 512;
+#else
+  WebServer portalServer(80);
+  DNSServer dnsServer;
+  Preferences prefs;
+#endif
+
+// ---------- Global ----------
+#if defined(ESP32)
+  const uint8_t SERVO_PIN = 18;
+#else
+  const uint8_t SERVO_PIN = D5;
+#endif
+
+// Kapak Durumları
+enum LidState {
+  LID_CLOSED   = 0,  // Kapalı
+  LID_OPENING  = 1,  // Açılıyor
+  LID_OPEN     = 2,  // Açık
+  LID_CLOSING  = 3   // Kapanıyor
+};
+
+Servo servo;
+bool  servoReady   = false;
+int   g_servoAngle = LID_CLOSED_ANGLE;
+int   g_targetAngle = LID_CLOSED_ANGLE;
+LidState g_lidState = LID_CLOSED;
+unsigned long g_lidOpenStartTime = 0;
+
+bool  g_netOK      = false;
+unsigned long t_lastPlot  = 0;
+unsigned long t_lastNet   = 0;
+unsigned long t_lastServo = 0;
+unsigned long t_lastFeedCheck = 0;
+String g_macAddress = "";
+int    g_lidOpenDurationOverrideMs = 0;  // 0 => sabit LID_OPEN_DURATION_MS kullan
+
+struct FeedSlot {
+  uint8_t hour;
+  uint8_t minute;
+  uint16_t durationMs;
+  uint16_t amount;
+  bool enabled;
+};
+
+FeedSlot g_feedSlots[16];
+int g_feedSlotCount = 0;
+int g_lastFedMinute = -1000;
+int g_localMinutesAtSync = -1;
+unsigned long g_millisAtSyncForTime = 0;
+unsigned long g_lastTimeSyncMs = 0;
+
+String savedSSID = "";
+String savedPASS = "";
+
+// ---------- Yardımcılar ----------
+static inline void plotLine(int servoAngle, int rssi, int internetOK, int lidState) {
+  Serial.print("ServoAngle:"); Serial.print(servoAngle);
+  Serial.print(" RSSI:");      Serial.print(rssi);
+  Serial.print(" InternetOK:");Serial.print(internetOK);
+  Serial.print(" LidState:"); Serial.println(lidState);
+}
+
+static inline int clamp(int v, int lo, int hi){ 
+  return (v<lo)?lo:((v>hi)?hi:v); 
+}
+
+const char* getLidStateText(LidState state) {
+  switch(state) {
+    case LID_CLOSED:  return "KAPALI";
+    case LID_OPENING: return "ACILIYOR";
+    case LID_OPEN:    return "ACIK";
+    case LID_CLOSING: return "KAPANIYOR";
+    default:          return "BILINMIYOR";
+  }
+}
+
+// ---------- Kapak Kontrol Fonksiyonları ----------
+void openLid() {
+  if (g_lidState == LID_CLOSED) {
+    Serial.println("[KAPAK] Açılma başlatıldı...");
+    g_targetAngle = LID_OPEN_ANGLE;
+    g_lidState = LID_OPENING;
+  }
+}
+
+void closeLid() {
+  if (g_lidState == LID_OPEN) {
+    Serial.println("[KAPAK] Kapanma başlatıldı...");
+    g_targetAngle = LID_CLOSED_ANGLE;
+    g_lidState = LID_CLOSING;
+  }
+}
+
+void updateServoMovement() {
+  if (!servoReady) return;
+  
+  unsigned long now = millis();
+  
+  // Servo hareketi
+  if (now - t_lastServo >= SERVO_STEP_INTERVAL_MS) {
+    t_lastServo = now;
+    
+    if (g_servoAngle != g_targetAngle) {
+      // Hedefe doğru hareket et
+      if (g_servoAngle < g_targetAngle) {
+        g_servoAngle = min(g_servoAngle + LID_MOVE_SPEED, g_targetAngle);
+      } else {
+        g_servoAngle = max(g_servoAngle - LID_MOVE_SPEED, g_targetAngle);
+      }
+      
+      servo.write(clamp(g_servoAngle, 0, 180));
+      
+      // Hedefe ulaşıldı mı?
+      if (g_servoAngle == g_targetAngle) {
+        if (g_lidState == LID_OPENING) {
+          g_lidState = LID_OPEN;
+          g_lidOpenStartTime = now;
+          Serial.println("[KAPAK] Tamamen açıldı!");
+        } else if (g_lidState == LID_CLOSING) {
+          g_lidState = LID_CLOSED;
+          Serial.println("[KAPAK] Tamamen kapandı!");
+        }
+      }
+    }
+  }
+  
+  // Kapak açık durum kontrolü - belirli süre sonra kapat
+  if (g_lidState == LID_OPEN) {
+    unsigned long target = (g_lidOpenDurationOverrideMs > 0 && g_lidOpenDurationOverrideMs < 60000)
+                           ? (unsigned long)g_lidOpenDurationOverrideMs
+                           : (unsigned long)LID_OPEN_DURATION_MS;
+    if (now - g_lidOpenStartTime >= target) {
+      // Bir sonraki besleme için override'ı sıfırla
+      g_lidOpenDurationOverrideMs = 0;
+      closeLid();
+    }
+  }
+}
+
+// ---------- Storage ----------
+void saveCredentials(const String &ssid, const String &pass) {
+#if defined(ESP32)
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+  Serial.println("[STORAGE] Kaydedildi (ESP32).");
+#else
+  EEPROM.begin(EEPROM_SIZE);
+  int addr = 0;
+  byte sl = ssid.length(); if (sl > 100) sl = 100;
+  byte pl = pass.length(); if (pl > 100) pl = 100;
+  EEPROM.write(addr++, sl);
+  for (int i=0;i<sl;i++) EEPROM.write(addr++, ssid[i]);
+  EEPROM.write(addr++, pl);
+  for (int i=0;i<pl;i++) EEPROM.write(addr++, pass[i]);
+  for (; addr < EEPROM_SIZE; addr++) EEPROM.write(addr, 0);
+  EEPROM.commit();
+  Serial.println("[STORAGE] Kaydedildi (ESP8266).");
+#endif
+}
+
+bool loadCredentials() {
+#if defined(ESP32)
+  prefs.begin("wifi", true);
+  savedSSID = prefs.getString("ssid", "");
+  savedPASS = prefs.getString("pass", "");
+  prefs.end();
+  if (savedSSID.length()) { Serial.println("[STORAGE] Credentials yüklendi (ESP32)."); return true; }
+  return false;
+#else
+  EEPROM.begin(EEPROM_SIZE);
+  int addr = 0;
+  byte sl = EEPROM.read(addr++);
+  if (sl == 0 || sl > 100) return false;
+  char buf[128];
+  for (int i=0;i<sl;i++) buf[i] = (char)EEPROM.read(addr++);
+  buf[sl] = 0; savedSSID = String(buf);
+  byte pl = EEPROM.read(addr++);
+  if (pl > 100) return false;
+  for (int i=0;i<pl;i++) buf[i] = (char)EEPROM.read(addr++);
+  buf[pl] = 0; savedPASS = String(buf);
+  Serial.println("[STORAGE] Credentials yüklendi (ESP8266).");
+  return savedSSID.length();
+#endif
+}
+
+// ---------- Portal HTML ----------
+const char* portalPage = R"rawliteral(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>WiFi Provision</title>
+<style>
+body{font-family:Arial;padding:10px;background:#f7f7f7;}
+.card{background:#fff;padding:12px;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,0.15);}
+h2{margin:0 0 8px 0;}
+label{display:block;margin-top:8px;font-size:14px;}
+input[type=text], input[type=password], select{width:100%;padding:8px;margin-top:6px;border:1px solid #ddd;border-radius:4px;}
+button{margin-top:12px;padding:10px 14px;border:0;background:#2196F3;color:#fff;border-radius:6px;font-size:16px;}
+.small{font-size:12px;color:#666;margin-top:8px;}
+.loading{font-size:13px;color:#999;}
+</style>
+</head><body>
+<div class="card">
+  <h2>Wi-Fi Ayarları</h2>
+  <div class="small">Aşağıdan ağı seçin (sinyal gücüne göre sıralı) veya manuel yazın.</div>
+  <form action="/save" method="POST">
+    <label>Mevcut Ağlar</label>
+    <select id="ssidList" name="ssid"><option value="">-- SSID taranıyor --</option></select>
+    <label>Veya manuel SSID</label>
+    <input type="text" id="manual" name="manual" placeholder="Gizli ağ için SSID yaz (opsiyonel)">
+    <label>Şifre</label>
+    <input type="password" name="pass" placeholder="WiFi Parolası (boş bırakılabilir)">
+    <button type="submit">Kaydet ve Bağlan</button>
+  </form>
+  <div class="small">Mevcut kayıtlı: <span id="cur"></span></div>
+  <div class="small loading" id="scanStatus">Tarama yapılıyor...</div>
+  <button id="rescanBtn" style="margin-top:8px;padding:8px 10px;">Tekrar Tara</button>
+</div>
+<script>
+function populate(list){
+  const sel = document.getElementById('ssidList');
+  sel.innerHTML = '';
+  const emptyOpt = document.createElement('option');
+  emptyOpt.value = ''; emptyOpt.text = '-- SSID seçin veya manuel girin --';
+  sel.appendChild(emptyOpt);
+  list.forEach(function(item){
+    const o = document.createElement('option');
+    o.value = item.ssid;
+    o.text  = item.ssid + ' (' + item.rssi + ' dBm, ch ' + item.ch + ')';
+    sel.appendChild(o);
+  });
+}
+function fetchScan(){
+  document.getElementById('scanStatus').innerText = 'Tarama yapılıyor...';
+  fetch('/scan').then(r=>r.json()).then(js=>{
+    populate(js);
+    document.getElementById('scanStatus').innerText = 'Tarama tamamlandı. Ağ sayısı: ' + js.length;
+  }).catch(_=>{
+    document.getElementById('scanStatus').innerText = 'Tarama başarısız.';
+  });
+}
+document.getElementById('rescanBtn').addEventListener('click', function(e){ e.preventDefault(); fetchScan(); });
+fetch('/current').then(r=>r.text()).then(t=>{document.getElementById('cur').innerText = t;}).catch(()=>{});
+fetchScan();
+</script>
+</body></html>
+)rawliteral";
+
+int getLocalMinutesNow() {
+  if (g_localMinutesAtSync < 0) return -1;
+  unsigned long diffMs = millis() - g_millisAtSyncForTime;
+  unsigned long diffMin = diffMs / 60000UL;
+  return (int)((g_localMinutesAtSync + (int)diffMin) % 1440);
+}
+
+bool syncTimeFromHttps() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure sclient;
+  sclient.setInsecure();
+  HTTPClient http;
+  const char* url = "https://clients3.google.com/generate_204";
+  http.setTimeout(4000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(sclient, url)) return false;
+  int code = http.GET();
+  if (code <= 0) {
+    http.end();
+    return false;
+  }
+  String date = http.header("Date");
+  http.end();
+  if (date.length() < 29) return false;
+  int h = (date[17] - '0') * 10 + (date[18] - '0');
+  int m = (date[20] - '0') * 10 + (date[21] - '0');
+  int utcMinutes = h * 60 + m;
+  int localMinutes = (utcMinutes + TZ_OFFSET_MIN + 1440) % 1440;
+  g_localMinutesAtSync = localMinutes;
+  g_millisAtSyncForTime = millis();
+  g_lastTimeSyncMs = millis();
+  return true;
+}
+
+// ---------- Handlers ----------
+void handleRoot() { portalServer.send(200, "text/html", portalPage); }
+
+void handleCurrent() {
+  String cur = savedSSID.length() ? savedSSID : "(yok)";
+  portalServer.send(200, "text/plain", cur);
+}
+
+void handleSave() {
+  if (portalServer.method() != HTTP_POST) { 
+    portalServer.send(405, "text/plain", "Method Not Allowed"); 
+    return; 
+  }
+  String ssid = portalServer.arg("ssid");
+  String manual = portalServer.arg("manual");
+  if (manual.length()) ssid = manual;
+  String pass = portalServer.arg("pass");
+  ssid.trim(); pass.trim();
+  if (ssid.length() == 0) { 
+    portalServer.send(400, "text/plain", "SSID boş olamaz"); 
+    return; 
+  }
+
+  saveCredentials(ssid, pass);
+  savedSSID = ssid; savedPASS = pass;
+
+  portalServer.send(200, "text/html",
+    "<html><body><h3>Kaydedildi. Cihaz yeni ağa bağlanmayı deniyor...</h3><p>Bu sayfayı kapatabilirsiniz.</p></body></html>");
+
+  Serial.println("[PORTAL] Yeni credentials alındı, bağlanma deneniyor...");
+  WiFi.disconnect(true);
+  delay(200);
+  WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+}
+
+void handleSchedule() {
+  if (portalServer.method() != HTTP_POST) {
+    portalServer.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  String body = portalServer.arg("plain");
+  StaticJsonDocument<1024> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    portalServer.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  JsonArray arr = doc.as<JsonArray>();
+  g_feedSlotCount = 0;
+  for (JsonObject it : arr) {
+    if (!it["enabled"]) continue;
+    const char* t = it["time"] | "";
+    if (!t || strlen(t) < 4) continue;
+    int h = (t[0] - '0') * 10 + (t[1] - '0');
+    int m = (t[3] - '0') * 10 + (t[4] - '0');
+    int dur = it["duration_ms"] | 0;
+    int amt = it["amount"] | 0;
+    if (g_feedSlotCount < 16) {
+      g_feedSlots[g_feedSlotCount].hour = (uint8_t)h;
+      g_feedSlots[g_feedSlotCount].minute = (uint8_t)m;
+      g_feedSlots[g_feedSlotCount].durationMs = (dur > 0 && dur < 60000) ? (uint16_t)dur : 0;
+      g_feedSlots[g_feedSlotCount].amount = (uint16_t)amt;
+      g_feedSlots[g_feedSlotCount].enabled = true;
+      g_feedSlotCount++;
+    }
+  }
+  g_lastFedMinute = -1000;
+  portalServer.send(200, "text/plain", "OK");
+}
+
+void handleNotFound() {
+  portalServer.sendHeader("Location", CAPTIVE_URL, true);
+  portalServer.send(302, "text/plain", "");
+}
+
+// ---------- /scan ----------
+void handleScan() {
+  Serial.println("[SCAN] Web istemcisinden tarama istendi.");
+  WiFi.mode(WIFI_AP_STA);
+  delay(50);
+
+#if defined(ESP32)
+  WiFi.scanDelete();
+  int n = WiFi.scanNetworks(false, true);
+#else
+  int n = WiFi.scanNetworks();
+#endif
+
+  const int MAXN = 50;
+  String ssids[MAXN]; int rssis[MAXN]; int chans[MAXN]; int encs[MAXN];
+  int m = 0;
+  for (int i=0; i<n && m<MAXN; i++) {
+    String s = WiFi.SSID(i); if (s.length() == 0) continue;
+    int r = WiFi.RSSI(i); int c = WiFi.channel(i);
+    int e = (int)WiFi.encryptionType(i);
+    bool found=false;
+    for (int k=0;k<m;k++){
+      if (ssids[k]==s){ found=true; if (r>rssis[k]){ rssis[k]=r; chans[k]=c; encs[k]=e; } break; }
+    }
+    if (!found){ ssids[m]=s; rssis[m]=r; chans[m]=c; encs[m]=e; m++; }
+  }
+  
+  for (int i=0;i<m-1;i++) for (int j=i+1;j<m;j++)
+    if (rssis[j] > rssis[i]){
+      String ts=ssids[i]; ssids[i]=ssids[j]; ssids[j]=ts;
+      int tr=rssis[i]; rssis[i]=rssis[j]; rssis[j]=tr;
+      int tc=chans[i]; chans[i]=chans[j]; chans[j]=tc;
+      int te=encs[i];  encs[i]=encs[j];  encs[j]=te;
+    }
+
+  String out = "[";
+  for (int i=0;i<m;i++){
+    String s = ssids[i]; s.replace("\\","\\\\"); s.replace("\"","\\\"");
+    out += "{\"ssid\":\""+s+"\",\"rssi\":"+String(rssis[i])+",\"ch\":"+String(chans[i])+",\"enc\":"+String(encs[i])+"}";
+    if (i<m-1) out += ",";
+  }
+  out += "]";
+  portalServer.send(200, "application/json", out);
+}
+
+// ---------- AP başlat ----------
+bool startAP() {
+#if defined(ESP32)
+  WiFi.setSleep(false);
+#else
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
+  WiFi.mode(WIFI_AP_STA);
+  delay(100);
+
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+
+  const int chans[] = {6,1,11};
+  bool ok = false;
+  for (int i=0;i<3 && !ok;i++){
+    ok = WiFi.softAP(AP_SSID, AP_PASS, chans[i], 0, 4);
+    Serial.print("[AP] softAP(): "); Serial.print(ok ? "OK" : "FAIL");
+    Serial.print(" on ch "); Serial.println(chans[i]);
+    if (!ok) delay(120);
+  }
+  if (!ok) return false;
+
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  portalServer.on("/generate_204", HTTP_ANY, [](){ 
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+  portalServer.on("/gen_204", HTTP_ANY, [](){
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+  portalServer.on("/hotspot-detect.html", HTTP_ANY, [](){ 
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+  portalServer.on("/library/test/success.html", HTTP_ANY, [](){ 
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+  portalServer.on("/ncsi.txt", HTTP_ANY, [](){
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+  portalServer.on("/connecttest.txt", HTTP_ANY, [](){ 
+    portalServer.sendHeader("Location", CAPTIVE_URL, true);
+    portalServer.send(302, "text/plain", "");
+  });
+
+  portalServer.on("/", HTTP_GET, handleRoot);
+  portalServer.on("/current", HTTP_GET, handleCurrent);
+  portalServer.on("/save", HTTP_POST, handleSave);
+  portalServer.on("/schedule", HTTP_POST, handleSchedule);
+  portalServer.on("/scan", HTTP_GET, handleScan);
+  portalServer.onNotFound(handleNotFound);
+  portalServer.begin();
+
+  Serial.println("[AP] Aktif.");
+  Serial.print("SSID : "); Serial.println(AP_SSID);
+  Serial.print("PASS : "); Serial.println(AP_PASS);
+  Serial.print("IP   : "); Serial.println(apIP);
+  Serial.println("[AP] Telefonda bu ağa bağlanın.");
+  Serial.print("[AP] Tarayıcı otomatik açılmadıysa "); Serial.print(CAPTIVE_URL);
+  Serial.println(" yazın (ör. http://wifi/).");
+  return true;
+}
+
+// ---------- STA ile bağlan ----------
+bool tryConnectSaved(uint32_t timeoutMs = 20000) {
+  if (!savedSSID.length()) return false;
+  Serial.print("[CONNECT] Kaydedilmiş SSID ile bağlanılıyor: "); Serial.println(savedSSID);
+
+  WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < timeoutMs) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    g_macAddress = WiFi.macAddress();
+    Serial.print("[OK] Bağlandı -> SSID: "); Serial.print(WiFi.SSID());
+    Serial.print(" | IP: ");                Serial.print(WiFi.localIP());
+    Serial.print(" | MAC: ");               Serial.println(g_macAddress);
+    String serialID = "ESP-" + g_macAddress; serialID.replace(":", "");
+    Serial.print("Seri No: "); Serial.println(serialID);
+    Serial.println("---------------------------------------");
+
+    WiFi.softAPdisconnect(true);
+
+    syncTimeFromHttps();
+
+    if (!servoReady) {
+      servo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+      servo.write(g_servoAngle);
+      servoReady = true;
+      Serial.println("[SERVO] Hazır ve kapalı pozisyonda (0°)");
+    }
+    return true;
+  }
+  Serial.println("[FAIL] Kaydedilmiş SSID ile bağlanılamadı.");
+  return false;
+}
+
+// ---------- Internet kontrolü ----------
+static bool checkInternet() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure sclient; sclient.setInsecure();
+  HTTPClient http;
+  const char* url = "https://clients3.google.com/generate_204";
+  http.setTimeout(4000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(sclient, url)) return false;
+  int code = http.GET();
+  http.end();
+  return (code >= 200 && code < 400);
+}
+
+// ---------- Yem Takvimi Kontrolü ----------
+static bool checkFeedingSchedule() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[FEED_CHECK] WiFi bağlı değil");
+    return false;
+  }
+  
+  if (g_macAddress.length() == 0) {
+    Serial.println("[FEED_CHECK] MAC adresi bulunamadı");
+    return false;
+  }
+  
+  WiFiClient client;
+  HTTPClient http;
+  
+  String url = String("http://") + BACKEND_HOST + ":" + String(BACKEND_PORT) + "/feed/check?mac=" + g_macAddress + "&tzOffsetMin=" + String(TZ_OFFSET_MIN);
+  Serial.print("[FEED_CHECK] İstek gönderiliyor: ");
+  Serial.println(url);
+  
+  http.setTimeout(5000);
+  if (!http.begin(client, url)) {
+    Serial.println("[FEED_CHECK] HTTP bağlantısı başlatılamadı");
+    return false;
+  }
+  
+  int httpCode = http.GET();
+  
+  if (httpCode > 0) {
+    Serial.print("[FEED_CHECK] HTTP Yanıt kodu: ");
+    Serial.println(httpCode);
+    
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      Serial.print("[FEED_CHECK] Yanıt: ");
+      Serial.println(payload);
+
+      StaticJsonDocument<512> doc;
+      DeserializationError err = deserializeJson(doc, payload);
+      if (!err) {
+        bool shouldFeed = doc["shouldFeed"] | false;
+        int durationMs = doc["durationMs"] | 0;
+        if (shouldFeed) {
+          if (durationMs > 0 && durationMs < 60000) {
+            g_lidOpenDurationOverrideMs = durationMs;
+            Serial.print("[FEED_CHECK] Süre (override): "); Serial.println(durationMs);
+          } else {
+            g_lidOpenDurationOverrideMs = 0;
+            Serial.println("[FEED_CHECK] Süre geçersiz veya yok, varsayılan kullanılacak");
+          }
+          // Besleme izni verildiğinde logla (süre bilgisiyle birlikte)
+          String meta = String("{\"duration_ms\":") + String(g_lidOpenDurationOverrideMs > 0 ? g_lidOpenDurationOverrideMs : LID_OPEN_DURATION_MS) + "}";
+          postLog("info", "Feeding allowed by schedule", meta);
+          http.end();
+          return true;
+        } else {
+          Serial.println("[FEED_CHECK] Şu an yem zamanı değil");
+        }
+      } else {
+        Serial.println("[FEED_CHECK] JSON parse hatası");
+      }
+    }
+  } else {
+    Serial.print("[FEED_CHECK] HTTP hatası: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+  
+  http.end();
+  return false;
+}
+
+void checkLocalScheduleAndFeed() {
+  if (!servoReady || g_feedSlotCount == 0) return;
+  int nowMin = getLocalMinutesNow();
+  if (nowMin < 0) return;
+  const int window = 1;
+  for (int i = 0; i < g_feedSlotCount; i++) {
+    if (!g_feedSlots[i].enabled) continue;
+    int slotMin = g_feedSlots[i].hour * 60 + g_feedSlots[i].minute;
+    if (abs(nowMin - slotMin) <= window) {
+      if (g_lastFedMinute >= 0 && abs(nowMin - g_lastFedMinute) <= window) {
+        continue;
+      }
+      g_lastFedMinute = nowMin;
+      if (g_feedSlots[i].durationMs > 0) {
+        g_lidOpenDurationOverrideMs = g_feedSlots[i].durationMs;
+      } else {
+        g_lidOpenDurationOverrideMs = 0;
+      }
+      String meta = String("{") + "\"duration_ms\":" + String(g_lidOpenDurationOverrideMs > 0 ? g_lidOpenDurationOverrideMs : LID_OPEN_DURATION_MS) + "}";
+      postLog("info", "FEED_EXECUTED (local schedule)", meta);
+      openLid();
+      break;
+    }
+  }
+}
+
+// Log gönderimi
+static void postLog(const String &level, const String &message, const String &metaJson = "") {
+  if (WiFi.status() != WL_CONNECTED || g_macAddress.length() == 0) return;
+  WiFiClient client;
+  HTTPClient http;
+  String url = String("http://") + BACKEND_HOST + ":" + String(BACKEND_PORT) + "/logs/ingest?mac=" + g_macAddress;
+  if (!http.begin(client, url)) return;
+  http.addHeader("Content-Type", "application/json");
+  String body = String("{") +
+    "\"level\":\"" + level + "\"," +
+    "\"message\":\"" + message + "\"" +
+    (metaJson.length() ? ",\"meta\":" + metaJson : "") +
+    "}";
+  http.POST(body);
+  http.end();
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(BAUDRATE);
+  delay(150);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("   SMART PET FEEDER - KAPAK İZLEME");
+  Serial.println("========================================");
+  Serial.println();
+
+  bool apOk = startAP();
+  if (!apOk) Serial.println("[AP] Başlatılamadı! Güç/kapsama sorunu olabilir.");
+
+  bool hasSaved = loadCredentials();
+  if (hasSaved) {
+    if (tryConnectSaved(15000)) {
+      // İlk yem kontrolünü 10 saniye sonra yap
+      t_lastFeedCheck = millis() - FEED_CHECK_INTERVAL_MS + 10000;
+      Serial.println("[INFO] Yem takvimi kontrolü 10 saniye sonra başlayacak...");
+    }
+  }
+  
+  Serial.println();
+  Serial.println("[INFO] Kapak Durumları:");
+  Serial.println("  0 = KAPALI");
+  Serial.println("  1 = ACILIYOR");
+  Serial.println("  2 = ACIK");
+  Serial.println("  3 = KAPANIYOR");
+  Serial.println();
+}
+
+// ---------- Loop ----------
+void loop() {
+  unsigned long now = millis();
+
+  dnsServer.processNextRequest();
+  portalServer.handleClient();
+
+  // Bağlı değilse periyodik yeniden dene
+  if (WiFi.status() != WL_CONNECTED && savedSSID.length()) {
+    static unsigned long t_lastRetry = 0;
+    if (now - t_lastRetry > 10000) {
+      t_lastRetry = now;
+      Serial.println("[RETRY] STA yeniden deneniyor...");
+      tryConnectSaved(8000);
+    }
+  } else {
+    if (now - t_lastNet >= NET_CHECK_INTERVAL_MS) {
+      t_lastNet = now;
+      g_netOK = checkInternet();
+    }
+  }
+
+  // Servo ve kapak durumu güncelleme
+  updateServoMovement();
+
+  // Serial Plotter verisi
+  if (now - t_lastPlot >= PLOT_INTERVAL_MS) {
+    t_lastPlot = now;
+    int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : -100;
+    plotLine(g_servoAngle, rssi, g_netOK ? 1 : 0, (int)g_lidState);
+  }
+
+  // Yem takvimi kontrolü (her dakika)
+  if (WiFi.status() == WL_CONNECTED && servoReady && g_lidState == LID_CLOSED) {
+    if (now - t_lastFeedCheck >= FEED_CHECK_INTERVAL_MS) {
+      t_lastFeedCheck = now;
+      checkLocalScheduleAndFeed();
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED && (g_lastTimeSyncMs == 0 || (now - g_lastTimeSyncMs) > 86400000UL)) {
+    syncTimeFromHttps();
+  }
+}

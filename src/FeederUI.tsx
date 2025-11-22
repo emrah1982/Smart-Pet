@@ -479,7 +479,19 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
             setScheduleId(data.id);
           }
         } catch {}
-        alert('Takvim oluşturuldu ve kaydedildi.');
+        try {
+          const syncRes = await fetch(`/devices/${selectedDeviceId}/schedules/sync`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+          if (syncRes.ok) {
+            alert('Takvim oluşturuldu, kaydedildi ve cihaza gönderildi.');
+          } else {
+            alert('Takvim oluşturuldu ve kaydedildi ancak cihaza gönderilemedi. Lütfen cihaz bağlantısını kontrol edin.');
+          }
+        } catch {
+          alert('Takvim oluşturuldu ve kaydedildi ancak cihaza gönderim sırasında hata oluştu.');
+        }
       }
     } else {
       const res = await fetch(`/devices/${selectedDeviceId}/schedules/${scheduleId}`, {
@@ -488,7 +500,19 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
         body: JSON.stringify({ items })
       });
       if (res.ok) {
-        alert('Takvim güncellendi.');
+        try {
+          const syncRes = await fetch(`/devices/${selectedDeviceId}/schedules/sync`, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+          if (syncRes.ok) {
+            alert('Takvim güncellendi ve cihaza gönderildi.');
+          } else {
+            alert('Takvim güncellendi ancak cihaza gönderilemedi. Lütfen cihaz bağlantısını kontrol edin.');
+          }
+        } catch {
+          alert('Takvim güncellendi ancak cihaza gönderim sırasında hata oluştu.');
+        }
       }
     }
   };
@@ -1086,6 +1110,9 @@ export default function FeederUI({ token, user, onLogout }: FeederUIProps) {
                   </div>
 
                   <div>
+                    <button onClick={handleSaveSchedule} className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold flex items-center gap-2">
+                      <Save className="w-4 h-4" /> Kaydet & Senkronize
+                    </button>
                     <label className="block text-white font-semibold mb-3 flex items-center gap-2">
                       <Scale className="w-4 h-4" />
                       Ağırlık Sensörü

@@ -1,0 +1,895 @@
+// ================== Serial / Debug ==================
+#define DEBUG 1
+#if defined(DEBUG)
+  #define LOG(fmt, ...) do { char __b[160]; snprintf(__b, sizeof(__b), "[%lu] " fmt, millis(), ##__VA_ARGS__); Serial.println(__b); } while(0)
+#else
+  #define LOG(fmt, ...) ((void)0)
+#endif
+
+// ================== Platform Detection ==================
+#if defined(ESP8266)
+  #include <ESP8266WiFi.h>
+  #include <ESP8266HTTPClient.h>
+  #include <ESP8266WebServer.h>
+  #include <DNSServer.h>
+  #include <EEPROM.h>
+  #include <Servo.h>
+  using HttpServer = ESP8266WebServer;
+#elif defined(ESP32)
+  #include <WiFi.h>
+  #include <HTTPClient.h>
+  #include <WebServer.h>
+  #include <DNSServer.h>
+  #include <Preferences.h>
+  #include <ESP32Servo.h>
+  using HttpServer = WebServer;
+#else
+  #error "Only ESP8266 or ESP32 is supported."
+#endif
+
+#include <WiFiClientSecure.h>
+
+// ================== Globals ==================
+#define BAUDRATE                115200
+
+// Servo Motor Globals
+// V1 tarzı: Doğrudan hareket (smooth yok)
+#define SERVO_STEP_INTERVAL_MS  50   // State kontrolü için, servo anında hareket eder
+#define SERVO_MIN_US            500
+#define SERVO_MAX_US            2400
+#define SERVO_DEFAULT_CLOSED_US 1000
+#define SERVO_DEFAULT_OPEN_US   1700
+#define OPEN_HOLD_MS            800   // default hold open before close (ms)
+
+// Access Point Globals
+#define AP_SSID                 "Feeder_AP"
+#define AP_PASS                 "fEEd_ME.199!"
+
+// IP Address Globals
+#define AP_IP_OCT1              192
+#define AP_IP_OCT2              168
+#define AP_IP_OCT3              1
+#define AP_IP_OCT4              1
+#define AP_NETMASK_OCT1         255
+#define AP_NETMASK_OCT2         255
+#define AP_NETMASK_OCT3         255
+#define AP_NETMASK_OCT4         0
+#define AP_GW_OCT1              192
+#define AP_GW_OCT2              168
+#define AP_GW_OCT3              1
+#define AP_GW_OCT4              1
+#define AP_PORT                 80
+#define AP_TIMEOUT              10000  // 10 seconds
+#define AP_MAX_CONNECTIONS      4
+#define AP_MAX_RETRIES          3
+#define AP_RETRY_DELAY          1000   // 1 second
+const int frequency_channels[] = {6, 7, 1, 11};
+
+// API & Portal Globals
+#define API_REQUEST_TIMEOUT_MS  10000
+const char* CAPTIVE_URL = "http://feeder.local/";
+
+// ================== Portal HTML ==================
+static const char portalPage[] PROGMEM =
+"<!doctype html><html><head><meta charset='utf-8'/>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+"<title>Feeder</title>"
+"<style>"
+":root{--bg:#f6f7f9;--fg:#111;--card:#fff;--muted:#666;--accent:#1a73e8;--pill:#eef2f6;--success:#0d9488}"
+"@media (prefers-color-scheme: dark){:root{--bg:#0e1116;--fg:#e6e6e6;--card:#161b22;--muted:#a0a0a0;--pill:#1f2630;--success:#14b8a6}}"
+"html,body{height:100%}"
+"body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif;display:grid;place-items:center;}"
+".card{width:min(92vw,460px);background:var(--card);border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,.08);padding:16px 16px 12px}"
+"h2{margin:0 0 12px;text-align:center;font-weight:600}"
+"fieldset{border:0;margin:12px 0;padding:0}"
+"legend{font-size:.95rem;margin-bottom:6px;color:var(--muted)}"
+"label{display:block;font-size:.9rem}"
+"input[type=time],input[type=number],input[type=range]{width:100%;padding:10px;border:1px solid #cfd6e4;border-radius:8px;background:transparent;color:inherit;box-sizing:border-box}"
+"input[type=range]{padding:0}"
+".row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}"
+"button{appearance:none;border:0;background:var(--accent);color:#fff;border-radius:8px;padding:10px 14px;font-weight:600;cursor:pointer}"
+"button:active{transform:translateY(1px)}"
+"button.secondary{background:var(--muted)}"
+"#times{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}"
+".pill{background:var(--pill);border-radius:999px;padding:4px 8px;display:inline-flex;align-items:center;gap:6px}"
+".pill button{background:transparent;color:var(--muted);padding:0 4px}"
+".week{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}"
+".week label{display:flex;align-items:center;justify-content:center;border:1px solid #cfd6e4;border-radius:8px;padding:8px 0;font-size:.85rem}"
+".foot{display:flex;gap:8px;justify-content:center;margin-top:10px;flex-wrap:wrap}"
+"#msg{min-height:1.2em;text-align:center;margin-top:6px}"
+".status-box{background:var(--pill);border-radius:8px;padding:12px;margin:8px 0;font-size:.9rem}"
+".status-box .label{color:var(--muted);font-size:.85rem;margin-bottom:4px}"
+".status-box .value{font-weight:600;font-size:1.1rem;color:var(--success)}"
+".sync-row{display:flex;gap:8px;align-items:center;margin-top:8px}"
+".sync-row button{flex:1}"
+"</style></head><body><main class='card'>"
+"<h2>Feeder Scheduler</h2>"
+"<fieldset><legend>Device Status</legend>"
+"<div class='status-box'>"
+"<div class='label'>Device Time (Local)</div>"
+"<div class='value' id='deviceTime'>Loading...</div>"
+"</div>"
+"<div class='status-box'>"
+"<div class='label'>Your Browser Time</div>"
+"<div class='value' id='browserTime'>--</div>"
+"</div>"
+"<div class='sync-row'>"
+"<button id='syncBtn' class='secondary'>Sync Time Now</button>"
+"<button id='refreshBtn' class='secondary'>Refresh Status</button>"
+"</div>"
+"</fieldset>"
+"<fieldset><legend>Feed Times (every day)</legend>"
+"<div class='row'><input id='timeInput' type='time' step='60'/><button id='addTime'>Add</button></div>"
+"<div id='times'></div></fieldset>"
+"<fieldset><legend>Exclude Days (no feed)</legend>"
+"<div class='week'>"
+"<label><input type='checkbox' class='wd' value='0'/>Sun</label>"
+"<label><input type='checkbox' class='wd' value='1'/>Mon</label>"
+"<label><input type='checkbox' class='wd' value='2'/>Tue</label>"
+"<label><input type='checkbox' class='wd' value='3'/>Wed</label>"
+"<label><input type='checkbox' class='wd' value='4'/>Thu</label>"
+"<label><input type='checkbox' class='wd' value='5'/>Fri</label>"
+"<label><input type='checkbox' class='wd' value='6'/>Sat</label>"
+"</div>"
+"<div style='font-size:.8rem;color:var(--muted);margin-top:4px;'>Checked days = NO feeding.</div>"
+"</fieldset>"
+"<fieldset><legend>Servo Settings</legend>"
+"<label style='display:block;margin-bottom:8px;'>"
+"Servo Angle: <span id='angleLabel'>90°</span>"
+"<input id='angle' type='range' min='0' max='180' step='5' value='90' "
+"style='width:100%;margin-top:4px;'/>"
+"</label>"
+"<label style='display:block;margin-top:6px;font-size:.9rem;'>"
+"Open duration "
+"<input id='hold' type='number' min='1' max='60' value='3' style='width:80px;display:inline-block;margin-left:4px;'/> sec"
+"</label>"
+"</fieldset>"
+"<div class='foot'><button id='save'>Save Schedule</button><button id='test'>Test Feed</button></div>"
+"<div id='msg'></div>"
+"<script>(function(){"
+"function updateAngleLabel(){const el=document.getElementById('angle');const label=document.getElementById('angleLabel');if(!el||!label)return;const v=el.value||90;label.textContent=v+'°';}"
+"const times=[];const timesEl=document.getElementById('times');"
+"function render(){timesEl.innerHTML='';times.forEach((t,i)=>{const s=document.createElement('span');s.className='pill';s.textContent=t+' ';const x=document.createElement('button');x.textContent='x';x.onclick=()=>{times.splice(i,1);render();};s.appendChild(x);timesEl.appendChild(s);});}"
+"document.getElementById('addTime').onclick=function(){const v=document.getElementById('timeInput').value;if(v&&!times.includes(v)){times.push(v);times.sort();render();}};"
+"function postForm(url,data){return fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(data)}).then(r=>r.text());}"
+"function updateBrowserTime(){const now=new Date();document.getElementById('browserTime').textContent=now.toLocaleString('en-GB',{weekday:'short',hour:'2-digit',minute:'2-digit',second:'2-digit',day:'2-digit',month:'short',year:'numeric'});}"
+"function syncTime(){const now=Math.floor(Date.now()/1000);const tz=new Date().getTimezoneOffset();"
+"document.getElementById('msg').textContent='Syncing time...';document.getElementById('msg').style.color='var(--muted)';"
+"postForm('/api/set-device-time/',{epoch:now,tz:tz}).then(()=>{document.getElementById('msg').textContent='Time synced successfully!';document.getElementById('msg').style.color='var(--success)';setTimeout(()=>document.getElementById('msg').textContent='',3000);updateStatus();}).catch(()=>{document.getElementById('msg').style.color='#900';document.getElementById('msg').textContent='Time sync failed';});}"
+"function updateStatus(){fetch('/api/get-status/').then(r=>r.json()).then(data=>{if(data.time){document.getElementById('deviceTime').textContent=data.time;}else{document.getElementById('deviceTime').textContent='Not set - Click Sync';}}).catch(()=>{document.getElementById('deviceTime').textContent='Error loading';});}"
+"function applyConfig(cfg){"
+"if(cfg.times){times.length=0;cfg.times.split(',').forEach(t=>{t=t.trim();if(t)times.push(t);});times.sort();render();}"
+"if(typeof cfg.angle!=='undefined'){document.getElementById('angle').value=cfg.angle;updateAngleLabel();}"
+"if(typeof cfg.hold!=='undefined'){document.getElementById('hold').value=cfg.hold;}"
+"if(cfg.exclude){const set=new Set(cfg.exclude.split(',').filter(x=>x!==''));document.querySelectorAll('.wd').forEach(cb=>{cb.checked=set.has(cb.value);});}"
+"}"
+"function loadConfig(){fetch('/api/get-config/').then(r=>r.json()).then(applyConfig).catch(()=>{});}"
+"document.getElementById('save').onclick=function(){"
+"const exclude=[...document.querySelectorAll('.wd:checked')].map(x=>x.value).join(',');"
+"const angle=document.getElementById('angle').value||'90';"
+"const hold=document.getElementById('hold').value||'3';"
+"document.getElementById('msg').textContent='Saving...';document.getElementById('msg').style.color='var(--muted)';"
+"postForm('/api/set-feed-time/',{times:times.join(','),exclude:exclude})"
+".then(()=>postForm('/api/set-servo-angle/',{angle:angle}))"
+".then(()=>postForm('/api/set-open-hold/',{hold:hold}))"
+".then(()=>{document.getElementById('msg').textContent='Saved successfully!';document.getElementById('msg').style.color='var(--success)';setTimeout(()=>document.getElementById('msg').textContent='',3000);})"
+".catch(()=>{document.getElementById('msg').style.color='#900';document.getElementById('msg').textContent='Error saving';});};"
+"document.getElementById('test').onclick=function(){"
+"document.getElementById('msg').textContent='Triggering test feed...';document.getElementById('msg').style.color='var(--muted)';"
+"postForm('/api/test-feed/',{})"
+".then(()=>{document.getElementById('msg').textContent='Test feed triggered!';document.getElementById('msg').style.color='var(--success)';setTimeout(()=>document.getElementById('msg').textContent='',3000);})"
+".catch(()=>{document.getElementById('msg').style.color='#900';document.getElementById('msg').textContent='Test feed failed';});};"
+"document.getElementById('syncBtn').onclick=syncTime;"
+"document.getElementById('refreshBtn').onclick=updateStatus;"
+"updateBrowserTime();setInterval(updateBrowserTime,1000);"
+"setInterval(updateStatus,1000);"
+"syncTime();updateStatus();loadConfig();"
+"const angleEl=document.getElementById('angle');if(angleEl){angleEl.addEventListener('input',updateAngleLabel);updateAngleLabel();}"
+"})();</script></main></body></html>";
+
+// ================== Local API Endpoints ==================
+const char* API_SET_FEED_TIME   = "/api/set-feed-time/";
+const char* API_SET_SERVO_ANGLE = "/api/set-servo-angle/";
+static const char* API_SET_DEVICE_TIME = "/api/set-device-time/";
+static const char* API_SET_OPEN_HOLD   = "/api/set-open-hold/";
+static const char* API_SET_TRAVEL      = "/api/set-travel/";
+static const char* API_GET_STATUS      = "/api/get-status/";
+static const char* API_TEST_FEED       = "/api/test-feed/";
+static const char* API_GET_CONFIG      = "/api/get-config/";
+
+// Server
+static HttpServer server(AP_PORT);
+
+// ================== Scheduling ==================
+#define MAX_FEED_TIMES 8
+
+struct FeedSchedule {
+  uint16_t timesMinutes[MAX_FEED_TIMES];
+  uint8_t  timesCount;
+  uint8_t  excludeBitmap;
+  uint8_t  lastRunDayForIndex[MAX_FEED_TIMES];
+  uint16_t lastRunMinuteForIndex[MAX_FEED_TIMES];
+};
+
+static FeedSchedule scheduleStore = {};
+static uint16_t servoAngleDegrees = 90;  // 0-180 derece
+
+static int64_t deviceEpochSetAtMs = 0;
+static int64_t deviceEpochBase    = 0;
+static int32_t tzOffsetMinutes    = 0;
+
+static uint32_t openHoldMs = OPEN_HOLD_MS;
+static uint16_t servoTravelMs = 300; // Kullanılmıyor (V1 tarzı doğrudan hareket)
+
+// ================== Time helpers ==================
+static inline uint32_t nowEpoch() {
+  if (deviceEpochSetAtMs == 0) return 0;
+  uint32_t elapsed = (uint32_t)((int64_t)millis() - deviceEpochSetAtMs) / 1000;
+  // deviceEpochBase artık "yerel epoch" (tarayıcıdan gelen epoch + tz ile hesaplanan)
+  return (uint32_t)(deviceEpochBase + elapsed);
+}
+
+static inline uint32_t nowLocalEpoch() {
+  // Tüm scheduler yerel epoch üzerinden çalışsın diye doğrudan nowEpoch() döndürülür
+  return nowEpoch();
+}
+
+static inline uint8_t dayOfWeek(uint32_t epoch) {
+  uint32_t days = epoch / 86400;
+  return (uint8_t)((days + 4) % 7);
+}
+
+static inline uint16_t minuteOfDay(uint32_t epoch) {
+  uint32_t secs = epoch % 86400;
+  return (uint16_t)(secs / 60);
+}
+
+static bool dayIsExcluded(uint8_t dow, uint8_t bitmap) {
+  return (bitmap >> (dow % 7)) & 0x1;
+}
+
+static void resetLastRunGuards() {
+  for (uint8_t i = 0; i < MAX_FEED_TIMES; i++) {
+    scheduleStore.lastRunDayForIndex[i]    = 255;
+    scheduleStore.lastRunMinuteForIndex[i] = 65535;
+  }
+}
+
+// ================== Persist (ESP32 NVS) ==================
+#if defined(ESP32)
+static void saveScheduleConfig() {
+  Preferences prefs;
+  prefs.begin("feeder", false);
+  prefs.putUChar("timesCount", scheduleStore.timesCount);
+  for (uint8_t i = 0; i < MAX_FEED_TIMES; i++) {
+    char key[4];
+    snprintf(key, sizeof(key), "t%u", i);
+    prefs.putUShort(key, scheduleStore.timesMinutes[i]);
+  }
+  prefs.putUChar("excludeBmp", scheduleStore.excludeBitmap);
+  prefs.putUShort("angle",     servoAngleDegrees);
+  prefs.putUInt ("holdMs",     openHoldMs);
+  prefs.putUShort("travelMs",  servoTravelMs);
+  
+  // Cihaz saatini de kaydet (elektrik gidip geldiğinde kurtarmak için)
+  if (deviceEpochSetAtMs != 0) {
+    uint32_t currentEpoch = nowEpoch();
+    prefs.putUInt("lastEpoch", currentEpoch);
+    prefs.putInt("tzOffset", tzOffsetMinutes);
+    LOG("Device time saved to NVS: epoch=%lu, tz=%ld", (unsigned long)currentEpoch, (long)tzOffsetMinutes);
+  }
+  
+  prefs.end();
+  LOG("Config saved to NVS");
+}
+
+static void loadScheduleConfig() {
+  Preferences prefs;
+  prefs.begin("feeder", true);
+  uint8_t cnt = prefs.getUChar("timesCount", 0);
+  if (cnt > MAX_FEED_TIMES) cnt = MAX_FEED_TIMES;
+  scheduleStore.timesCount = cnt;
+  for (uint8_t i = 0; i < cnt; i++) {
+    char key[4];
+    snprintf(key, sizeof(key), "t%u", i);
+    scheduleStore.timesMinutes[i] = prefs.getUShort(key, 0);
+  }
+  scheduleStore.excludeBitmap = prefs.getUChar("excludeBmp", 0);
+  servoAngleDegrees           = prefs.getUShort("angle", 90);
+  openHoldMs                  = prefs.getUInt("holdMs", OPEN_HOLD_MS);
+  servoTravelMs               = prefs.getUShort("travelMs", 300); // Uyumluluk için yüklenir
+  // HIZ PROFİLİ: 200–3000 ms aralığına sıkıştır
+  if (servoTravelMs < 200)  servoTravelMs = 200;
+  if (servoTravelMs > 3000) servoTravelMs = 3000;
+  
+  // Cihaz saatini geri yükle (elektrik gidip geldiğinde)
+  uint32_t savedEpoch = prefs.getUInt("lastEpoch", 0);
+  int32_t savedTz = prefs.getInt("tzOffset", 0);
+  if (savedEpoch > 0) {
+    deviceEpochBase = (int64_t)savedEpoch;
+    tzOffsetMinutes = savedTz;
+    deviceEpochSetAtMs = (int64_t)millis();
+    LOG("Device time restored from NVS: epoch=%lu, tz=%ld", (unsigned long)savedEpoch, (long)savedTz);
+    
+    uint32_t le = nowLocalEpoch();
+    if (le != 0) {
+      uint8_t dow = dayOfWeek(le);
+      uint16_t mod = minuteOfDay(le);
+      uint8_t hh = mod / 60;
+      uint8_t mm = mod % 60;
+      const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+      LOG("Restored local time: %s %02u:%02u (DOW=%u)", days[dow], hh, mm, (unsigned)dow);
+    }
+  } else {
+    LOG("No saved device time in NVS - user must sync time from web");
+  }
+  
+  prefs.end();
+  resetLastRunGuards();
+  LOG("Config loaded from NVS: count=%u, angle=%u°, holdMs=%lu, excludeBitmap=0x%02X, travelMs=%u",
+      (unsigned)scheduleStore.timesCount,
+      (unsigned)servoAngleDegrees,
+      (unsigned long)openHoldMs,
+      (unsigned)scheduleStore.excludeBitmap,
+      (unsigned)servoTravelMs);
+}
+#else
+static void saveScheduleConfig() {}
+static void loadScheduleConfig() {}
+#endif
+
+// ================== Parsing helpers ==================
+static bool parseTimesArg(const String& s) {
+  uint8_t count = 0;
+  uint16_t tmp[MAX_FEED_TIMES] = {};
+  int start = 0;
+
+  while (start < (int)s.length() && count < MAX_FEED_TIMES) {
+    int comma = s.indexOf(',', start);
+    String piece = (comma == -1) ? s.substring(start) : s.substring(start, comma);
+    piece.trim();
+    if (piece.length() == 5 && piece.charAt(2) == ':') {
+      int hh = piece.substring(0,2).toInt();
+      int mm = piece.substring(3,5).toInt();
+      if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+        tmp[count++] = (uint16_t)(hh * 60 + mm);
+      }
+    }
+    if (comma == -1) break;
+    start = comma + 1;
+  }
+  if (count == 0) return false;
+
+  for (uint8_t i = 1; i < count; i++) {
+    uint16_t key = tmp[i];
+    int j = i - 1;
+    while (j >= 0 && tmp[j] > key) { tmp[j+1] = tmp[j]; j--; }
+    tmp[j+1] = key;
+  }
+
+  scheduleStore.timesCount = count;
+  for (uint8_t i = 0; i < count; i++) {
+    scheduleStore.timesMinutes[i] = tmp[i];
+  }
+  resetLastRunGuards();
+
+  LOG("Parsed %u feed times:", (unsigned)scheduleStore.timesCount);
+  for (uint8_t i = 0; i < scheduleStore.timesCount; i++) {
+    uint16_t m = scheduleStore.timesMinutes[i];
+    uint8_t hh = m / 60;
+    uint8_t mm = m % 60;
+    LOG("  time[%u] = %02u:%02u", (unsigned)i, hh, mm);
+  }
+
+  return true;
+}
+
+static void parseExcludeArg(const String& s) {
+  uint8_t mask = 0;
+  int start = 0;
+  while (start < (int)s.length()) {
+    int comma = s.indexOf(',', start);
+    String piece = (comma == -1) ? s.substring(start) : s.substring(start, comma);
+    piece.trim();
+    if (piece.length() > 0) {
+      int d = piece.toInt();
+      if (d >= 0 && d <= 6) mask |= (1 << d);
+    }
+    if (comma == -1) break;
+    start = comma + 1;
+  }
+  scheduleStore.excludeBitmap = mask;
+  LOG("Exclude bitmap set to 0x%02X (bit=1 => NO FEED)", (unsigned)mask);
+}
+
+// ================== Motor Controller ==================
+#define USE_SERVO 1
+
+#if defined(USE_SERVO)
+  static Servo feederServo;
+  static uint16_t servoCurrentUs = SERVO_DEFAULT_CLOSED_US;
+  static uint16_t servoTargetUs  = SERVO_DEFAULT_CLOSED_US;
+  static uint32_t servoLastStepAt = 0;
+  static uint8_t  motorState      = 0;
+  static uint32_t stateEnteredAt  = 0;
+
+  #if defined(ESP8266)
+    #define SERVO_PIN 2
+  #else
+    #define SERVO_PIN 18
+  #endif
+#else
+  #if defined(ESP8266)
+    #define STEPPER_STEP_PIN 12
+    #define STEPPER_DIR_PIN  13
+    #define STEPPER_EN_PIN   14
+  #else
+    #define STEPPER_STEP_PIN 26
+    #define STEPPER_DIR_PIN  27
+    #define STEPPER_EN_PIN   25
+  #endif
+  #define STEPS_PER_REV 200
+  #define MICROSTEPPING 8
+  #define DEG_PER_STEP (360.0f/(STEPS_PER_REV*MICROSTEPPING))
+  static volatile int32_t stepsRemaining = 0;
+  static uint8_t  motorState = 0;
+  static uint32_t lastStepAtUs = 0;
+  #define STEP_INTERVAL_US 800
+#endif
+
+// Artık doğrudan açı kullanılıyor, hesaplama yok
+int motor_degree_calculate() {
+  int deg = (int)servoAngleDegrees;
+  if (deg < 0) deg = 0;
+  if (deg > 180) deg = 180;
+  return deg;
+}
+
+void motor_turn() {
+#if defined(USE_SERVO)
+  // V1 tarzı: Doğrudan hedef pozisyona git (smooth hareket yok)
+  if (servoCurrentUs != servoTargetUs) {
+    servoCurrentUs = servoTargetUs;
+    feederServo.writeMicroseconds(servoCurrentUs);
+    LOG("Servo moved to %u µs", (unsigned)servoCurrentUs);
+  }
+#else
+  if (motorState == 1 && stepsRemaining != 0) {
+    uint32_t nowUs = micros();
+    if ((uint32_t)(nowUs - lastStepAtUs) >= STEP_INTERVAL_US) {
+      lastStepAtUs = nowUs;
+      digitalWrite(STEPPER_STEP_PIN, HIGH);
+      digitalWrite(STEPPER_STEP_PIN, LOW);
+      stepsRemaining -= (stepsRemaining > 0) ? 1 : -1;
+      if (stepsRemaining == 0) motorState = 0;
+    }
+  }
+#endif
+}
+
+void motor_open() {
+#if defined(USE_SERVO)
+  if (motorState != 0) return;
+  int deg = motor_degree_calculate();
+  uint16_t openUs = SERVO_DEFAULT_CLOSED_US +
+                    (uint16_t)((SERVO_MAX_US - SERVO_MIN_US) * (float)deg / 180.0f);
+  if (openUs > SERVO_MAX_US) openUs = SERVO_MAX_US;
+
+  LOG("motor_open: deg=%d, targetUs=%u (V1 tarzı: anında hareket)", deg, (unsigned)openUs);
+
+  servoTargetUs = openUs;
+  motorState = 1;
+  stateEnteredAt = millis();
+#else
+  if (motorState != 0) return;
+  int deg = motor_degree_calculate();
+  int32_t steps = (int32_t)((float)deg / DEG_PER_STEP);
+  digitalWrite(STEPPER_DIR_PIN, HIGH);
+  digitalWrite(STEPPER_EN_PIN, LOW);
+  stepsRemaining = steps;
+  motorState = 1;
+#endif
+}
+
+void motor_close() {
+#if defined(USE_SERVO)
+  LOG("motor_close: targetUs=%u", (unsigned)SERVO_DEFAULT_CLOSED_US);
+  servoTargetUs = SERVO_DEFAULT_CLOSED_US;
+  motorState = 3;
+  stateEnteredAt = millis();
+#else
+  digitalWrite(STEPPER_DIR_PIN, LOW);
+  digitalWrite(STEPPER_EN_PIN, LOW);
+  stepsRemaining = -stepsRemaining;
+  motorState = 1;
+#endif
+}
+
+static void motorTick() {
+#if defined(USE_SERVO)
+  const uint32_t now = millis();
+  
+  // V1 tarzı: Servo anında hareket eder, state geçişleri hızlı
+  if (motorState == 1) {
+    // Açma komutu verildi, servo anında gider
+    motor_turn();
+    LOG("Servo reached open position, start holding");
+    motorState = 2;
+    stateEnteredAt = now;
+  } else if (motorState == 2) {
+    // Açık tutma süresi
+    if ((uint32_t)(now - stateEnteredAt) >= openHoldMs) {
+      LOG("Hold time (%lu ms) elapsed, closing", (unsigned long)openHoldMs);
+      motor_close();
+    }
+  } else if (motorState == 3) {
+    // Kapanma komutu verildi, servo anında gider
+    motor_turn();
+    LOG("Servo back to closed position");
+    motorState = 0;
+  }
+#else
+  motor_turn();
+  if (motorState == 0) {
+    digitalWrite(STEPPER_EN_PIN, HIGH);
+  }
+#endif
+}
+
+// ================== AP & HTTP ==================
+bool startAP() {
+  IPAddress ip(AP_IP_OCT1, AP_IP_OCT2, AP_IP_OCT3, AP_IP_OCT4);
+  IPAddress gw(AP_GW_OCT1, AP_GW_OCT2, AP_GW_OCT3, AP_GW_OCT4);
+  IPAddress nm(AP_NETMASK_OCT1, AP_NETMASK_OCT2, AP_NETMASK_OCT3, AP_NETMASK_OCT4);
+
+  WiFi.mode(WIFI_AP);
+  bool ok = false;
+
+#if defined(ESP8266)
+  WiFi.softAPConfig(ip, gw, nm);
+  ok = WiFi.softAP(AP_SSID, AP_PASS, frequency_channels[0], false, AP_MAX_CONNECTIONS);
+#else
+  WiFi.softAPConfig(ip, gw, nm);
+  ok = WiFi.softAP(AP_SSID, AP_PASS, frequency_channels[0], 0, AP_MAX_CONNECTIONS);
+#endif
+
+  if (!ok) {
+    LOG("AP start failed");
+    return false;
+  }
+  LOG("AP started: %s", WiFi.softAPIP().toString().c_str());
+  return true;
+}
+
+void handleRoot() {
+  server.setContentLength(strlen_P(portalPage));
+  server.send_P(200, "text/html", portalPage);
+}
+void handleSave() { server.send(200, "text/plain", "OK"); }
+void handleNotFound() { server.send(404, "text/plain", "Not found"); }
+
+void handleAPISetFeedTime();
+void handleAPISetServoAngle();
+static void handleAPISetDeviceTime();
+static void handleAPISetOpenHold();
+static void handleAPISetTravel();
+static void handleAPIGetStatus();
+static void handleAPITestFeed();
+static void handleAPIGetConfig();
+
+// ================== Handlers ==================
+void handleAPISetFeedTime() {
+  String times   = server.hasArg("times")   ? server.arg("times")   : "";
+  String exclude = server.hasArg("exclude") ? server.arg("exclude") : "";
+
+  LOG("handleAPISetFeedTime: times='%s' exclude='%s'", times.c_str(), exclude.c_str());
+
+  bool ok = false;
+  if (times.length() > 0) {
+    ok = parseTimesArg(times);
+  }
+  if (exclude.length() > 0) {
+    parseExcludeArg(exclude);
+  } else {
+    scheduleStore.excludeBitmap = 0;
+    LOG("No exclude days specified -> all days allowed");
+  }
+
+  if (!ok && times.length() > 0) {
+    server.send(400, "text/plain", "Invalid times");
+    return;
+  }
+
+  saveScheduleConfig();
+  server.send(200, "text/plain", "OK");
+}
+
+void handleAPISetServoAngle() {
+  if (!server.hasArg("angle")) {
+    server.send(400, "text/plain", "Missing angle");
+    return;
+  }
+  int a = server.arg("angle").toInt();
+  if (a < 0) a = 0;
+  if (a > 180) a = 180;
+  servoAngleDegrees = (uint16_t)a;
+  LOG("Servo angle set to %u degrees", (unsigned)servoAngleDegrees);
+  saveScheduleConfig();
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleAPISetDeviceTime() {
+  if (!(server.hasArg("epoch") && server.hasArg("tz"))) {
+    server.send(400, "text/plain", "Missing params");
+    return;
+  }
+  int64_t utcEpoch = (int64_t)server.arg("epoch").toInt();
+  tzOffsetMinutes  = (int32_t)server.arg("tz").toInt();
+
+  // Tarayıcıdan gelen epoch (UTC) + tz (getTimezoneOffset) ile yerel epoch hesapla
+  // localEpoch = utcEpoch - tzOffsetMinutes*60  (tzOffsetMinutes Türkiye için genelde -180)
+  int64_t localEpoch = utcEpoch - (int64_t)tzOffsetMinutes * 60;
+
+  // Cihaz bundan sonra doğrudan yerel epoch üzerinden çalışacak
+  deviceEpochBase  = localEpoch;
+  deviceEpochSetAtMs = (int64_t)millis();
+
+  uint32_t le = nowLocalEpoch();
+  if (le != 0) {
+    uint8_t dow = dayOfWeek(le);
+    uint16_t mod = minuteOfDay(le);
+    uint8_t hh = mod / 60;
+    uint8_t mm = mod % 60;
+    const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    LOG("Device time set: utcEpoch=%ld tzOffset=%ld min localBase=%ld", (long)utcEpoch, (long)tzOffsetMinutes, (long)deviceEpochBase);
+    LOG("Calculated local time: %s %02u:%02u (DOW=%u, minute=%u)",
+        days[dow], hh, mm, (unsigned)dow, (unsigned)mod);
+  } else {
+    LOG("Device time set but local epoch still 0");
+  }
+
+  // Cihaz saatini hemen NVS'e kaydet (elektrik giderse kurtarmak için)
+  saveScheduleConfig();
+
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleAPISetOpenHold() {
+  if (!server.hasArg("hold")) {
+    server.send(400, "text/plain", "Missing hold");
+    return;
+  }
+  int h = server.arg("hold").toInt();
+  if (h <= 0) h = 1;
+  if (h > 60) h = 60;
+  openHoldMs = (uint32_t)h * 1000UL;
+  LOG("Open hold set to %d sec (%lu ms)", h, (unsigned long)openHoldMs);
+  saveScheduleConfig();
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleAPISetTravel() {
+  if (!server.hasArg("travel")) {
+    server.send(400, "text/plain", "Missing travel");
+    return;
+  }
+  int t = server.arg("travel").toInt();
+  if (t < 200)  t = 200;   // yeni min
+  if (t > 3000) t = 3000;
+  servoTravelMs = (uint16_t)t;
+  LOG("Servo travel time set to %d ms", t);
+  saveScheduleConfig();
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleAPIGetStatus() {
+  uint32_t le = nowLocalEpoch();
+  String json = "{";
+
+  if (le == 0) {
+    json += "\"time\":\"Not set\",";
+    json += "\"epoch\":0";
+  } else {
+    uint8_t dow = dayOfWeek(le);
+    uint16_t mod = minuteOfDay(le);
+    uint8_t hh = mod / 60;
+    uint8_t mm = mod % 60;
+    uint8_t ss = (le % 86400) % 60;
+    const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    char timeStr[64];
+    snprintf(timeStr, sizeof(timeStr), "%s %02u:%02u:%02u", days[dow], hh, mm, ss);
+    json += "\"time\":\"";
+    json += timeStr;
+    json += "\",";
+    json += "\"epoch\":";
+    json += String((unsigned long)le);
+    json += ",";
+    json += "\"dow\":";
+    json += String(dow);
+    json += ",";
+    json += "\"motorState\":";
+    json += String(motorState);
+  }
+
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleAPITestFeed() {
+  LOG("API test-feed called");
+  if (motorState == 0) {
+    motor_open();
+  } else {
+    LOG("Test feed: motor busy (%u)", (unsigned)motorState);
+  }
+  server.send(200, "text/plain", "TEST FEED TRIGGERED");
+}
+
+static void handleAPIGetConfig() {
+  String json = "{";
+
+  json += "\"times\":\"";
+  for (uint8_t i = 0; i < scheduleStore.timesCount; i++) {
+    uint16_t m = scheduleStore.timesMinutes[i];
+    uint8_t hh = m / 60;
+    uint8_t mm = m % 60;
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%02u:%02u", (unsigned)hh, (unsigned)mm);
+    json += buf;
+    if (i + 1 < scheduleStore.timesCount) json += ",";
+  }
+  json += "\",";
+
+  json += "\"exclude\":\"";
+  if (scheduleStore.excludeBitmap != 0) {
+    bool first = true;
+    for (uint8_t d = 0; d < 7; d++) {
+      if ((scheduleStore.excludeBitmap >> d) & 0x1) {
+        if (!first) json += ",";
+        json += String(d);
+        first = false;
+      }
+    }
+  }
+  json += "\",";
+
+  json += "\"angle\":";
+  json += String((unsigned)servoAngleDegrees);
+  json += ",";
+
+  json += "\"hold\":";
+  json += String((unsigned long)(openHoldMs / 1000UL));
+
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// ================== Scheduler ==================
+static void triggerFeedIfIdle() {
+  if (motorState == 0) {
+    LOG(">>> TRIGGER FEED: Motor idle, starting open <<<");
+    motor_open();
+  } else {
+    LOG(">>> TRIGGER FEED: Motor busy (state=%u), skipped <<<", (unsigned)motorState);
+  }
+}
+
+static void schedulerTick() {
+  static uint32_t lastTickAt = 0;
+  const uint32_t nowMs = millis();
+  if ((uint32_t)(nowMs - lastTickAt) < 250) return;
+  lastTickAt = nowMs;
+
+  uint32_t le = nowLocalEpoch();
+  if (le == 0) {
+    static uint32_t lastWarnAt = 0;
+    if (nowMs - lastWarnAt > 5000) {
+      LOG("Scheduler: Device time not set yet (local epoch = 0)");
+      lastWarnAt = nowMs;
+    }
+    return;
+  }
+
+  uint8_t  dow = dayOfWeek(le);
+  uint16_t mod = minuteOfDay(le);
+
+  static uint16_t lastLoggedMinute = 65535;
+  if (mod != lastLoggedMinute) {
+    lastLoggedMinute = mod;
+    uint8_t hh = mod / 60;
+    uint8_t mm = mod % 60;
+    bool excluded = dayIsExcluded(dow, scheduleStore.excludeBitmap);
+    const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+
+    LOG("*** CLOCK TICK: %s %02u:%02u (DOW=%u) %s ***",
+        days[dow], hh, mm, (unsigned)dow, excluded ? "[EXCLUDED DAY - NO FEED]" : "");
+
+    if (scheduleStore.timesCount > 0) {
+      LOG("Scheduled times today: %u times", (unsigned)scheduleStore.timesCount);
+      for (uint8_t i = 0; i < scheduleStore.timesCount; i++) {
+        uint16_t m = scheduleStore.timesMinutes[i];
+        uint8_t shh = m / 60;
+        uint8_t smm = m % 60;
+        LOG("  - Time %u: %02u:%02u (minute %u)", (unsigned)i, shh, smm, (unsigned)m);
+      }
+    }
+    
+    // Her 10 dakikada bir saati NVS'e kaydet (elektrik giderse max 10 dk kayıp)
+    if (mm % 10 == 0 && deviceEpochSetAtMs != 0) {
+      saveScheduleConfig();
+      LOG("Auto-saved device time to NVS (every 10 min backup)");
+    }
+  }
+
+  if (dayIsExcluded(dow, scheduleStore.excludeBitmap)) {
+    return;
+  }
+
+  for (uint8_t i = 0; i < scheduleStore.timesCount; i++) {
+    if (scheduleStore.timesMinutes[i] == mod) {
+      if (scheduleStore.lastRunDayForIndex[i] != dow ||
+          scheduleStore.lastRunMinuteForIndex[i] != mod) {
+        scheduleStore.lastRunDayForIndex[i]    = dow;
+        scheduleStore.lastRunMinuteForIndex[i] = mod;
+        LOG("Scheduled feed at minute %u (dow %u)", (unsigned)mod, (unsigned)dow);
+        triggerFeedIfIdle();
+      }
+    }
+  }
+}
+
+// ================== Setup & Loop ==================
+void setup() {
+#if defined(DEBUG)
+  Serial.begin(BAUDRATE);
+  Serial.println();
+  Serial.println("###################");
+  Serial.println("\t Feeder Local v1");
+  Serial.println("###################");
+#endif
+
+#if defined(USE_SERVO)
+  LOG("Attaching servo on pin %d", SERVO_PIN);
+  feederServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  feederServo.writeMicroseconds(SERVO_DEFAULT_CLOSED_US);
+  servoCurrentUs = SERVO_DEFAULT_CLOSED_US;
+  servoTargetUs  = SERVO_DEFAULT_CLOSED_US;
+#else
+  pinMode(STEPPER_STEP_PIN, OUTPUT);
+  pinMode(STEPPER_DIR_PIN,  OUTPUT);
+  pinMode(STEPPER_EN_PIN,   OUTPUT);
+  digitalWrite(STEPPER_EN_PIN, HIGH);
+#endif
+
+  resetLastRunGuards();
+  loadScheduleConfig();
+
+  if (!startAP()) {
+    for (int i = 0; i < AP_MAX_RETRIES; i++) {
+      delay(AP_RETRY_DELAY);
+      if (startAP()) break;
+    }
+  }
+
+  server.on("/",                 handleRoot);
+  server.on(API_SET_FEED_TIME,   HTTP_POST, handleAPISetFeedTime);
+  server.on(API_SET_SERVO_ANGLE, HTTP_POST, handleAPISetServoAngle);
+  server.on(API_SET_DEVICE_TIME, HTTP_POST, handleAPISetDeviceTime);
+  server.on(API_SET_OPEN_HOLD,   HTTP_POST, handleAPISetOpenHold);
+  server.on(API_SET_TRAVEL,      HTTP_POST, handleAPISetTravel);
+  server.on(API_GET_STATUS,      HTTP_GET,  handleAPIGetStatus);
+  server.on(API_TEST_FEED,       HTTP_POST, handleAPITestFeed);
+  server.on(API_GET_CONFIG,      HTTP_GET,  handleAPIGetConfig);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  LOG("HTTP server started. Please connect to http://%s", WiFi.softAPIP().toString().c_str());
+}
+
+void loop() {
+  server.handleClient();
+  schedulerTick();
+  motorTick();
+  yield();
+}

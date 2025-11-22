@@ -174,6 +174,21 @@ unsigned long t_lastFeedCheck = 0;
 String g_macAddress = "";
 int    g_lidOpenDurationOverrideMs = 0;  // 0 => sabit LID_OPEN_DURATION_MS kullan
 
+struct FeedSlot {
+  uint8_t hour;
+  uint8_t minute;
+  uint16_t durationMs;
+  uint16_t amount;
+  bool enabled;
+};
+
+FeedSlot g_feedSlots[16];
+int g_feedSlotCount = 0;
+int g_lastFedMinute = -1000;
+int g_localMinutesAtSync = -1;
+unsigned long g_millisAtSyncForTime = 0;
+unsigned long g_lastTimeSyncMs = 0;
+
 String savedSSID = "";
 String savedPASS = "";
 
@@ -371,6 +386,40 @@ fetchScan();
 </body></html>
 )rawliteral";
 
+int getLocalMinutesNow() {
+  if (g_localMinutesAtSync < 0) return -1;
+  unsigned long diffMs = millis() - g_millisAtSyncForTime;
+  unsigned long diffMin = diffMs / 60000UL;
+  return (int)((g_localMinutesAtSync + (int)diffMin) % 1440);
+}
+
+bool syncTimeFromHttps() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClientSecure sclient;
+  sclient.setInsecure();
+  HTTPClient http;
+  const char* url = "https://clients3.google.com/generate_204";
+  http.setTimeout(4000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(sclient, url)) return false;
+  int code = http.GET();
+  if (code <= 0) {
+    http.end();
+    return false;
+  }
+  String date = http.header("Date");
+  http.end();
+  if (date.length() < 29) return false;
+  int h = (date[17] - '0') * 10 + (date[18] - '0');
+  int m = (date[20] - '0') * 10 + (date[21] - '0');
+  int utcMinutes = h * 60 + m;
+  int localMinutes = (utcMinutes + TZ_OFFSET_MIN + 1440) % 1440;
+  g_localMinutesAtSync = localMinutes;
+  g_millisAtSyncForTime = millis();
+  g_lastTimeSyncMs = millis();
+  return true;
+}
+
 // ---------- Handlers ----------
 void handleRoot() { portalServer.send(200, "text/html", portalPage); }
 
@@ -404,6 +453,41 @@ void handleSave() {
   WiFi.disconnect(true);
   delay(200);
   WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+}
+
+void handleSchedule() {
+  if (portalServer.method() != HTTP_POST) {
+    portalServer.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  String body = portalServer.arg("plain");
+  StaticJsonDocument<1024> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    portalServer.send(400, "text/plain", "Invalid JSON");
+    return;
+  }
+  JsonArray arr = doc.as<JsonArray>();
+  g_feedSlotCount = 0;
+  for (JsonObject it : arr) {
+    if (!it["enabled"]) continue;
+    const char* t = it["time"] | "";
+    if (!t || strlen(t) < 4) continue;
+    int h = (t[0] - '0') * 10 + (t[1] - '0');
+    int m = (t[3] - '0') * 10 + (t[4] - '0');
+    int dur = it["duration_ms"] | 0;
+    int amt = it["amount"] | 0;
+    if (g_feedSlotCount < 16) {
+      g_feedSlots[g_feedSlotCount].hour = (uint8_t)h;
+      g_feedSlots[g_feedSlotCount].minute = (uint8_t)m;
+      g_feedSlots[g_feedSlotCount].durationMs = (dur > 0 && dur < 60000) ? (uint16_t)dur : 0;
+      g_feedSlots[g_feedSlotCount].amount = (uint16_t)amt;
+      g_feedSlots[g_feedSlotCount].enabled = true;
+      g_feedSlotCount++;
+    }
+  }
+  g_lastFedMinute = -1000;
+  portalServer.send(200, "text/plain", "OK");
 }
 
 void handleNotFound() {
@@ -508,6 +592,7 @@ bool startAP() {
   portalServer.on("/", HTTP_GET, handleRoot);
   portalServer.on("/current", HTTP_GET, handleCurrent);
   portalServer.on("/save", HTTP_POST, handleSave);
+  portalServer.on("/schedule", HTTP_POST, handleSchedule);
   portalServer.on("/scan", HTTP_GET, handleScan);
   portalServer.onNotFound(handleNotFound);
   portalServer.begin();
@@ -545,6 +630,8 @@ bool tryConnectSaved(uint32_t timeoutMs = 20000) {
     Serial.println("---------------------------------------");
 
     WiFi.softAPdisconnect(true);
+
+    syncTimeFromHttps();
 
     if (!servoReady) {
       servo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
@@ -642,6 +729,32 @@ static bool checkFeedingSchedule() {
   return false;
 }
 
+void checkLocalScheduleAndFeed() {
+  if (!servoReady || g_feedSlotCount == 0) return;
+  int nowMin = getLocalMinutesNow();
+  if (nowMin < 0) return;
+  const int window = 1;
+  for (int i = 0; i < g_feedSlotCount; i++) {
+    if (!g_feedSlots[i].enabled) continue;
+    int slotMin = g_feedSlots[i].hour * 60 + g_feedSlots[i].minute;
+    if (abs(nowMin - slotMin) <= window) {
+      if (g_lastFedMinute >= 0 && abs(nowMin - g_lastFedMinute) <= window) {
+        continue;
+      }
+      g_lastFedMinute = nowMin;
+      if (g_feedSlots[i].durationMs > 0) {
+        g_lidOpenDurationOverrideMs = g_feedSlots[i].durationMs;
+      } else {
+        g_lidOpenDurationOverrideMs = 0;
+      }
+      String meta = String("{") + "\"duration_ms\":" + String(g_lidOpenDurationOverrideMs > 0 ? g_lidOpenDurationOverrideMs : LID_OPEN_DURATION_MS) + "}";
+      postLog("info", "FEED_EXECUTED (local schedule)", meta);
+      openLid();
+      break;
+    }
+  }
+}
+
 // Log gönderimi
 static void postLog(const String &level, const String &message, const String &metaJson = "") {
   if (WiFi.status() != WL_CONNECTED || g_macAddress.length() == 0) return;
@@ -727,9 +840,11 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED && servoReady && g_lidState == LID_CLOSED) {
     if (now - t_lastFeedCheck >= FEED_CHECK_INTERVAL_MS) {
       t_lastFeedCheck = now;
-      if (checkFeedingSchedule()) {
-        openLid();
-      }
+      checkLocalScheduleAndFeed();
     }
+  }
+
+  if (WiFi.status() == WL_CONNECTED && (g_lastTimeSyncMs == 0 || (now - g_lastTimeSyncMs) > 86400000UL)) {
+    syncTimeFromHttps();
   }
 }
